@@ -9,4 +9,5 @@ Je suis un bot entièrement dédié à simplifier vos recherches de groupe (LFG)
 * `/hitory` ( afficher l'historique des sessions de groupe).
 
 **BIENTÔT** 
-Beta  Possibilité d'invité un utilisateur à rejoindre la session en message privé avec le menu contextuel.
+
+Possibilité d'invité un utilisateur à rejoindre la session en message privé avec le menu contextuel.
