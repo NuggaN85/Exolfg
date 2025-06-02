@@ -1,3 +1,5 @@
+**`Mise à jour : version 1.1.4`**
+
 # LFG Discord Bot
 
 Le bot Discord "Looking For Group" (LFG) est conçu pour aider les joueurs à trouver des groupes pour jouer ensemble. Il permet de créer des sessions de jeu, de rejoindre des sessions existantes, et de gérer les participants.
