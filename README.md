@@ -19,6 +19,7 @@ Le bot LFG permet aux utilisateurs de créer des sessions de jeu pour divers jeu
 - **Afficher les statistiques** : Affichez les statistiques des sessions LFG.
 - **Afficher l'historique** : Affichez l'historique des sessions LFG.
 - **Définir le salon pour les annonces LFG** : Définissez le salon pour les annonces LFG.
+- **Commandes Slash** : Utilisation de commandes slash pour interagir avec le bot.
 
 ## Prérequis
 
@@ -85,6 +86,6 @@ Pour toute question ou suggestion, n'hésitez pas à ouvrir une issue ou à me c
 
 ---
 
-© 2023 Ludovic Rose. Tous droits réservés.
+© 2025 Ludovic Rose. Tous droits réservés.
 
 [![Donate](https://img.shields.io/badge/paypal-donate-yellow.svg?style=flat)](https://www.paypal.me/nuggan85) [![v1.1.4](http://img.shields.io/badge/zip-v1.1.4-blue.svg)](https://github.com/NuggaN85/Exolfg/archive/master.zip) [![GitHub license](https://img.shields.io/github/license/NuggaN85/Exolfg)](https://github.com/NuggaN85/Exolfg)
