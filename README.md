@@ -86,6 +86,6 @@ Pour toute question ou suggestion, n'hésitez pas à ouvrir une issue ou à me c
 
 ---
 
-© 2025 Ludovic Rose. Tous droits réservés.
-
 [![Donate](https://img.shields.io/badge/paypal-donate-yellow.svg?style=flat)](https://www.paypal.me/nuggan85) [![v1.1.4](http://img.shields.io/badge/zip-v1.1.4-blue.svg)](https://github.com/NuggaN85/Exolfg/archive/master.zip) [![GitHub license](https://img.shields.io/github/license/NuggaN85/Exolfg)](https://github.com/NuggaN85/Exolfg)
+
+© 2025 Ludovic Rose. Tous droits réservés.
