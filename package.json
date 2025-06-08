@@ -1,0 +1,27 @@
+{
+  "name": "EXOLFG",
+  "version": "1.0.2",
+  "description": "Je suis un bot inter-serveurs ultra-rapide taillé pour booster tes recherches de groupe (LFG) !",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "update-deps": "npx npm-check-updates -u && npm install"
+  },
+  "dependencies": {
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.5.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10",
+    "eslint": "^9.25.1",
+    "npm-check-updates": "17.1.14"
+  },
+  "engines": {
+  "node": ">=20.0.0",
+  "npm": ">=10.0.0"
+  },
+  "author": "EXOBOT",
+  "license": "MIT"
+}
