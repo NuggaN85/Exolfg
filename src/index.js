@@ -18,8 +18,7 @@ import {
   ThumbnailBuilder,
   SeparatorBuilder,
 } from 'discord.js';
-import fs from 'fs/promises';
-import path from 'path';
+import Database from 'better-sqlite3';
 
 // Configuration des variables d'environnement
 dotenv.config();
@@ -37,13 +36,57 @@ const client = new Client({
   ],
 });
 
+// Initialisation de la base de données SQLite
+const db = new Database('lfgData.db', { verbose: console.log });
+
+// Création des tables si elles n'existent pas
+db.exec(`
+  CREATE TABLE IF NOT EXISTS lfgSessions (
+    id TEXT PRIMARY KEY,
+    userId TEXT,
+    user TEXT,
+    game TEXT,
+    platform TEXT,
+    activity TEXT,
+    gametag TEXT,
+    description TEXT,
+    date TEXT,
+    players INTEGER,
+    categoryId TEXT,
+    voiceChannelId TEXT,
+    textChannelId TEXT,
+    infoTextChannelId TEXT,
+    infoMessageId TEXT,
+    commandChannelId TEXT,
+    commandChannelMessageId TEXT,
+    guildId TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS lfgJoinedUsers (
+    sessionId TEXT,
+    userId TEXT,
+    PRIMARY KEY (sessionId, userId),
+    FOREIGN KEY (sessionId) REFERENCES lfgSessions(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS lfgStats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    totalSessions INTEGER DEFAULT 0,
+    totalPlayers INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS webhookChannels (
+    guildId TEXT PRIMARY KEY,
+    channelId TEXT
+  );
+`);
+
+// Initialisation des Maps pour la gestion en mémoire
 const lfgSessions = new Map();
 const lfgStats = { totalSessions: 0, totalPlayers: 0 };
 const lfgJoinedUsers = new Map();
-const webhookChannels = new Map(); // Map<guildId, channelId>
+const webhookChannels = new Map();
 const rateLimiter = {};
-const DATA_FILE = path.resolve('./lfgData.json');
-const WEBHOOK_DATA_FILE = path.resolve('./webhookData.json');
 const SESSION_EXPIRY = 24 * 60 * 60 * 1000; // 24 heures
 const ITEMS_PER_PAGE = 10;
 
@@ -65,35 +108,37 @@ const gameChoices = [
 // Charger les données au démarrage
 async function loadData() {
   try {
-    try {
-      await fs.access(DATA_FILE);
-    } catch {
-      await fs.writeFile(DATA_FILE, JSON.stringify({ lfgSessions: {}, lfgJoinedUsers: {}, lfgStats: { totalSessions: 0, totalPlayers: 0 } }, null, 2));
-      console.log('✅ Fichier lfgData.json créé.');
+    // Charger lfgSessions
+    const sessions = db.prepare('SELECT * FROM lfgSessions').all();
+    for (const session of sessions) {
+      lfgSessions.set(session.id, { ...session, timeoutId: null });
     }
-
-    const data = await fs.readFile(DATA_FILE, 'utf8');
-    const parsed = JSON.parse(data);
-    for (const [id, session] of Object.entries(parsed.lfgSessions || {})) {
-      lfgSessions.set(id, session);
-    }
-    for (const [id, users] of Object.entries(parsed.lfgJoinedUsers || {})) {
-      lfgJoinedUsers.set(id, users);
-    }
-    Object.assign(lfgStats, parsed.lfgStats || { totalSessions: 0, totalPlayers: 0 });
     console.log('✅ Sessions chargées:', Array.from(lfgSessions.entries()));
 
-    try {
-      const webhookData = await fs.readFile(WEBHOOK_DATA_FILE, 'utf8');
-      const parsedWebhook = JSON.parse(webhookData);
-      for (const [guildId, channelId] of Object.entries(parsedWebhook.webhookChannels || {})) {
-        webhookChannels.set(guildId, channelId);
+    // Charger lfgJoinedUsers
+    const users = db.prepare('SELECT sessionId, userId FROM lfgJoinedUsers').all();
+    for (const user of users) {
+      if (!lfgJoinedUsers.has(user.sessionId)) {
+        lfgJoinedUsers.set(user.sessionId, []);
       }
-      console.log('✅ Webhooks chargés:', Object.fromEntries(webhookChannels));
-    } catch {
-      await fs.writeFile(WEBHOOK_DATA_FILE, JSON.stringify({ webhookChannels: {} }, null, 2));
-      console.log('✅ Fichier webhookData.json créé.');
+      lfgJoinedUsers.get(user.sessionId).push(user.userId);
     }
+    console.log('✅ Utilisateurs chargés:', Object.fromEntries(lfgJoinedUsers));
+
+    // Charger lfgStats
+    const stats = db.prepare('SELECT totalSessions, totalPlayers FROM lfgStats LIMIT 1').get() || {
+      totalSessions: 0,
+      totalPlayers: 0,
+    };
+    Object.assign(lfgStats, stats);
+    console.log('✅ Stats chargées:', lfgStats);
+
+    // Charger webhookChannels
+    const webhooks = db.prepare('SELECT guildId, channelId FROM webhookChannels').all();
+    for (const webhook of webhooks) {
+      webhookChannels.set(webhook.guildId, webhook.channelId);
+    }
+    console.log('✅ Webhooks chargés:', Object.fromEntries(webhookChannels));
   } catch (error) {
     console.error('⚠️ Erreur chargement données:', error);
   }
@@ -102,20 +147,64 @@ async function loadData() {
 // Sauvegarder les données
 async function saveData() {
   try {
-    const sessionsObj = Object.fromEntries(
-      Array.from(lfgSessions.entries()).map(([id, session]) => {
-        const { timeoutId, ...serializableSession } = session;
-        return [id, serializableSession];
-      })
-    );
-    const usersObj = Object.fromEntries(lfgJoinedUsers);
-    const data = { lfgSessions: sessionsObj, lfgJoinedUsers: usersObj, lfgStats };
-    await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
-    console.log('✅ Données sauvegardées dans', DATA_FILE);
+    const insertSession = db.prepare(`
+      INSERT OR REPLACE INTO lfgSessions (
+        id, userId, user, game, platform, activity, gametag, description, date,
+        players, categoryId, voiceChannelId, textChannelId, infoTextChannelId,
+        infoMessageId, commandChannelId, commandChannelMessageId, guildId
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
 
-    const webhookData = { webhookChannels: Object.fromEntries(webhookChannels) };
-    await fs.writeFile(WEBHOOK_DATA_FILE, JSON.stringify(webhookData, null, 2));
-    console.log('✅ Webhooks sauvegardés dans', WEBHOOK_DATA_FILE);
+    const insertUser = db.prepare('INSERT OR REPLACE INTO lfgJoinedUsers (sessionId, userId) VALUES (?, ?)');
+    const deleteUsers = db.prepare('DELETE FROM lfgJoinedUsers WHERE sessionId = ?');
+    const updateStats = db.prepare('INSERT OR REPLACE INTO lfgStats (id, totalSessions, totalPlayers) VALUES (1, ?, ?)');
+    const insertWebhook = db.prepare('INSERT OR REPLACE INTO webhookChannels (guildId, channelId) VALUES (?, ?)');
+
+    const transaction = db.transaction(() => {
+      // Sauvegarder lfgSessions
+      for (const [id, session] of lfgSessions) {
+        const { timeoutId, ...serializableSession } = session;
+        insertSession.run(
+          id,
+          serializableSession.userId,
+          serializableSession.user,
+          serializableSession.game,
+          serializableSession.platform,
+          serializableSession.activity,
+          serializableSession.gametag,
+          serializableSession.description,
+          serializableSession.date,
+          serializableSession.players,
+          serializableSession.categoryId,
+          serializableSession.voiceChannelId,
+          serializableSession.textChannelId,
+          serializableSession.infoTextChannelId,
+          serializableSession.infoMessageId,
+          serializableSession.commandChannelId,
+          serializableSession.commandChannelMessageId,
+          serializableSession.guildId
+        );
+      }
+
+      // Sauvegarder lfgJoinedUsers
+      for (const [sessionId, users] of lfgJoinedUsers) {
+        deleteUsers.run(sessionId);
+        for (const userId of users) {
+          insertUser.run(sessionId, userId);
+        }
+      }
+
+      // Sauvegarder lfgStats
+      updateStats.run(lfgStats.totalSessions, lfgStats.totalPlayers);
+
+      // Sauvegarder webhookChannels
+      for (const [guildId, channelId] of webhookChannels) {
+        insertWebhook.run(guildId, channelId);
+      }
+    });
+
+    transaction();
+    console.log('✅ Données sauvegardées dans la base de données SQLite');
   } catch (error) {
     console.error('⚠️ Erreur sauvegarde données:', error);
   }
@@ -186,10 +275,18 @@ async function deleteLFGSession(sessionId, guild) {
 
     for (const channel of channels) await safeDeleteChannel(channel);
 
+    const deleteSession = db.prepare('DELETE FROM lfgSessions WHERE id = ?');
+    const deleteUsers = db.prepare('DELETE FROM lfgJoinedUsers WHERE sessionId = ?');
+    const transaction = db.transaction(() => {
+      deleteSession.run(sessionId);
+      deleteUsers.run(sessionId);
+    });
+    transaction();
+
     lfgSessions.delete(sessionId);
     lfgJoinedUsers.delete(sessionId);
     await saveData();
-    console.log(`✅ Session ${sessionId} supprimée du serveur et du fichier JSON.`);
+    console.log(`✅ Session ${sessionId} supprimée du serveur et de la base de données.`);
   } catch (error) {
     console.error(`⚠️ Erreur suppression session ${sessionId}:`, error);
   }
@@ -776,6 +873,8 @@ async function handleKickMemberCommand(interaction) {
     const voiceChannel = guild.channels.cache.get(session.voiceChannelId);
     if (voiceChannel && targetMember.voice.channelId === voiceChannel.id) {
       await targetMember.voice.disconnect();
+      const deleteUser = db.prepare('DELETE FROM lfgJoinedUsers WHERE sessionId = ? AND userId = ?');
+      deleteUser.run(sessionId, targetMember.id);
       const joinedUsers = lfgJoinedUsers.get(sessionId).filter(id => id !== targetMember.id);
       lfgJoinedUsers.set(sessionId, joinedUsers);
       await saveData();
@@ -821,6 +920,8 @@ async function handleBanMemberCommand(interaction) {
     if (voiceChannel && targetMember.voice.channelId === voiceChannel.id) {
       await targetMember.voice.disconnect();
       await guild.members.ban(targetMember, { reason: `Banni de la session LFG ${sessionId}` });
+      const deleteUser = db.prepare('DELETE FROM lfgJoinedUsers WHERE sessionId = ? AND userId = ?');
+      deleteUser.run(sessionId, targetMember.id);
       const joinedUsers = lfgJoinedUsers.get(sessionId).filter(id => id !== targetMember.id);
       lfgJoinedUsers.set(sessionId, joinedUsers);
       await saveData();
@@ -997,6 +1098,8 @@ async function handleJoinButton(interaction) {
     if (voiceChannel) {
       joinedUsers.push(interaction.user.id);
       lfgJoinedUsers.set(sessionId, joinedUsers);
+      const insertUser = db.prepare('INSERT OR REPLACE INTO lfgJoinedUsers (sessionId, userId) VALUES (?, ?)');
+      insertUser.run(sessionId, interaction.user.id);
       await saveData();
 
       const infoTextChannel = interaction.guild.channels.cache.get(session.textChannelId);
@@ -1193,10 +1296,10 @@ client.once(Events.ClientReady, async () => {
 });
 
 // Handler SIGINT/SIGTERM/uncaughtException/unhandledRejection
-process.on('SIGINT', async () => { await saveData(); process.exit(0); });
-process.on('SIGTERM', async () => { await saveData(); process.exit(0); });
-process.on('uncaughtException', async (err) => { console.error(err); await saveData(); client.destroy(); process.exit(1); });
-process.on('unhandledRejection', async (err) => { console.error(err); await saveData(); client.destroy(); process.exit(1); });
+process.on('SIGINT', async () => { await saveData(); db.close(); process.exit(0); });
+process.on('SIGTERM', async () => { await saveData(); db.close(); process.exit(0); });
+process.on('uncaughtException', async (err) => { console.error(err); await saveData(); db.close(); client.destroy(); process.exit(1); });
+process.on('unhandledRejection', async (err) => { console.error(err); await saveData(); db.close(); client.destroy(); process.exit(1); });
 
 // Connexion du bot
 client.login(process.env.DISCORD_TOKEN)
