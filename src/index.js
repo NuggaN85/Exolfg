@@ -66,7 +66,7 @@ db.exec(`
     sessionId TEXT,
     userId TEXT,
     PRIMARY KEY (sessionId, userId),
-    FOREIGN KEY (sessionId) REFERENCES lfgSessions(id)
+    FOREIGN KEY (sessionId) REFERENCES lfgSessions(id) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS lfgStats (
