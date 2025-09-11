@@ -88,6 +88,8 @@ const lfgJoinedUsers = new Map();
 const webhookChannels = new Map();
 const rateLimiter = {};
 const SESSION_EXPIRY = 24 * 60 * 60 * 1000; // 24 heures
+const CACHE_TTL = 60 * 60 * 1000; // 1 heure pour les sessions
+const WEBHOOK_TTL = 30 * 60 * 1000; // 30 minutes pour les webhooks
 const ITEMS_PER_PAGE = 10;
 
 // Liste des jeux supportés
@@ -105,23 +107,67 @@ const gameChoices = [
   { name: 'Albion Online', value: 'Albion Online' },
 ];
 
+// Fonction pour définir avec TTL
+const setWithTTL = (map, key, value, ttl) => {
+  map.set(key, { value, expiresAt: Date.now() + ttl });
+};
+
+// Nettoyage périodique des entrées expirées
+setInterval(() => {
+  const now = Date.now();
+  
+  // Nettoyage de lfgSessions
+  for (const [key, data] of lfgSessions) {
+    if (data.expiresAt && now > data.expiresAt) {
+      const guild = client.guilds.cache.get(data.value.guildId);
+      if (guild) deleteLFGSession(key, guild);
+    }
+  }
+
+  // Nettoyage de lfgJoinedUsers
+  for (const [key, data] of lfgJoinedUsers) {
+    if (data.expiresAt && now > data.expiresAt) {
+      lfgJoinedUsers.delete(key);
+      db.prepare('DELETE FROM lfgJoinedUsers WHERE sessionId = ?').run(key);
+    }
+  }
+
+  // Nettoyage de webhookChannels
+  for (const [key, data] of webhookChannels) {
+    if (data.expiresAt && now > data.expiresAt) {
+      webhookChannels.delete(key);
+      db.prepare('DELETE FROM webhookChannels WHERE guildId = ?').run(key);
+    }
+  }
+}, 60000); // Vérification toutes les minutes
+
+// Surveillance de la mémoire
+setInterval(() => {
+  const used = process.memoryUsage();
+  console.log(`📊 Utilisation mémoire: RSS=${(used.rss / 1024 / 1024).toFixed(2)}MB, HeapTotal=${(used.heapTotal / 1024 / 1024).toFixed(2)}MB, HeapUsed=${(used.heapUsed / 1024 / 1024).toFixed(2)}MB`);
+  console.log(`📈 Taille des caches: lfgSessions=${lfgSessions.size}, lfgJoinedUsers=${lfgJoinedUsers.size}, webhookChannels=${webhookChannels.size}`);
+}, 300000); // Vérification toutes les 5 minutes
+
 // Charger les données au démarrage
 async function loadData() {
   try {
     // Charger lfgSessions
     const sessions = db.prepare('SELECT * FROM lfgSessions').all();
     for (const session of sessions) {
-      lfgSessions.set(session.id, { ...session, timeoutId: null });
+      setWithTTL(lfgSessions, session.id, { ...session, timeoutId: null }, CACHE_TTL);
     }
     console.log('✅ Sessions chargées:', Array.from(lfgSessions.entries()));
 
     // Charger lfgJoinedUsers
     const users = db.prepare('SELECT sessionId, userId FROM lfgJoinedUsers').all();
     for (const user of users) {
-      if (!lfgJoinedUsers.has(user.sessionId)) {
-        lfgJoinedUsers.set(user.sessionId, []);
+      const existing = lfgJoinedUsers.get(user.sessionId);
+      if (!existing) {
+        setWithTTL(lfgJoinedUsers, user.sessionId, [user.userId], CACHE_TTL);
+      } else {
+        existing.value.push(user.userId);
+        lfgJoinedUsers.set(user.sessionId, existing);
       }
-      lfgJoinedUsers.get(user.sessionId).push(user.userId);
     }
     console.log('✅ Utilisateurs chargés:', Object.fromEntries(lfgJoinedUsers));
 
@@ -136,7 +182,7 @@ async function loadData() {
     // Charger webhookChannels
     const webhooks = db.prepare('SELECT guildId, channelId FROM webhookChannels').all();
     for (const webhook of webhooks) {
-      webhookChannels.set(webhook.guildId, webhook.channelId);
+      setWithTTL(webhookChannels, webhook.guildId, webhook.channelId, WEBHOOK_TTL);
     }
     console.log('✅ Webhooks chargés:', Object.fromEntries(webhookChannels));
   } catch (error) {
@@ -162,8 +208,8 @@ async function saveData() {
 
     const transaction = db.transaction(() => {
       // Sauvegarder lfgSessions
-      for (const [id, session] of lfgSessions) {
-        const { timeoutId, ...serializableSession } = session;
+      for (const [id, data] of lfgSessions) {
+        const { timeoutId, ...serializableSession } = data.value;
         insertSession.run(
           id,
           serializableSession.userId,
@@ -187,7 +233,8 @@ async function saveData() {
       }
 
       // Sauvegarder lfgJoinedUsers
-      for (const [sessionId, users] of lfgJoinedUsers) {
+      for (const [sessionId, data] of lfgJoinedUsers) {
+        const users = data.value;
         deleteUsers.run(sessionId);
         for (const userId of users) {
           insertUser.run(sessionId, userId);
@@ -198,8 +245,8 @@ async function saveData() {
       updateStats.run(lfgStats.totalSessions, lfgStats.totalPlayers);
 
       // Sauvegarder webhookChannels
-      for (const [guildId, channelId] of webhookChannels) {
-        insertWebhook.run(guildId, channelId);
+      for (const [guildId, data] of webhookChannels) {
+        insertWebhook.run(guildId, data.value);
       }
     });
 
@@ -217,7 +264,8 @@ setInterval(async () => {
     rateLimiter[userId] = rateLimiter[userId].filter((ts) => now - ts < 60000);
     if (!rateLimiter[userId].length) delete rateLimiter[userId];
   }
-  for (const [sessionId, session] of lfgSessions) {
+  for (const [sessionId, data] of lfgSessions) {
+    const session = data.value;
     if (now - new Date(session.date).getTime() > SESSION_EXPIRY) {
       const guild = client.guilds.cache.get(session.guildId);
       if (guild) await deleteLFGSession(sessionId, guild);
@@ -227,9 +275,10 @@ setInterval(async () => {
 
 // Réinitialisation du timeout de suppression
 function resetTimeout(sessionId, guild) {
-  const session = lfgSessions.get(sessionId);
-  if (!session) return;
+  const sessionData = lfgSessions.get(sessionId);
+  if (!sessionData) return;
 
+  const session = sessionData.value;
   if (session.timeoutId) {
     clearTimeout(session.timeoutId);
     console.log(`❌ Timeout annulé pour ${sessionId}`);
@@ -244,7 +293,8 @@ function resetTimeout(sessionId, guild) {
       console.log(`❌ Salon non vide pour ${sessionId}.`);
     }
   }, 5 * 60 * 1000);
-  lfgSessions.set(sessionId, session);
+  
+  setWithTTL(lfgSessions, sessionId, session, CACHE_TTL);
 }
 
 // Suppression sécurisée d’un canal
@@ -260,8 +310,10 @@ async function safeDeleteChannel(channel) {
 
 // Suppression d’une session LFG
 async function deleteLFGSession(sessionId, guild) {
-  const session = lfgSessions.get(sessionId);
-  if (!session) return;
+  const sessionData = lfgSessions.get(sessionId);
+  if (!sessionData) return;
+
+  const session = sessionData.value;
 
   try {
     if (session.timeoutId) clearTimeout(session.timeoutId);
@@ -296,7 +348,7 @@ async function deleteLFGSession(sessionId, guild) {
 async function updateRichPresence() {
   try {
     const totalSessions = lfgSessions.size;
-    const totalPlayers = Array.from(lfgJoinedUsers.values()).reduce((acc, users) => acc + users.length, 0);
+    const totalPlayers = Array.from(lfgJoinedUsers.values()).reduce((acc, data) => acc + (data.value || []).length, 0);
 
     client.user?.setPresence({
       activities: [{ name: `Sessions: ${totalSessions} | Joueurs: ${totalPlayers}`, type: ActivityType.Playing }],
@@ -562,6 +614,7 @@ async function handleLFGCommand(interaction) {
       .addSeparatorComponents(new SeparatorBuilder())
       .addActionRowComponents(buttonRow)
       .addSeparatorComponents(new SeparatorBuilder())
+      .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Participants :** <@${user.id}>`))
       .addTextDisplayComponents(textFooter)
       .setAccentColor(hexColor);
 
@@ -572,7 +625,8 @@ async function handleLFGCommand(interaction) {
     });
 
     // Envoyer l'annonce à tous les serveurs sauf celui où la commande a été exécutée
-    for (const [guildId, channelId] of webhookChannels) {
+    for (const [guildId, data] of webhookChannels) {
+      const channelId = data.value;
       if (guildId === guild.id) continue;
       try {
         const targetGuild = client.guilds.cache.get(guildId);
@@ -601,7 +655,7 @@ async function handleLFGCommand(interaction) {
 
     await interaction.followUp({ content: `✅ Session créée ! Voir ${textChannel} et ${infoTextChannel}.`, flags: [MessageFlags.Ephemeral] });
 
-    lfgSessions.set(randomNumber, {
+    const sessionData = {
       userId: user.id,
       user: user.tag,
       game,
@@ -620,10 +674,11 @@ async function handleLFGCommand(interaction) {
       commandChannelMessageId: commandChannelMessage.id,
       timeoutId: null,
       guildId: guild.id,
-    });
-    console.log(`✅ Session créée: ${randomNumber}`, lfgSessions.get(randomNumber));
+    };
+    setWithTTL(lfgSessions, randomNumber, sessionData, CACHE_TTL);
+    console.log(`✅ Session créée: ${randomNumber}`, sessionData);
 
-    lfgJoinedUsers.set(randomNumber, [user.id]);
+    setWithTTL(lfgJoinedUsers, randomNumber, [user.id], CACHE_TTL);
     lfgStats.totalSessions++;
     lfgStats.totalPlayers += players;
     await saveData();
@@ -653,13 +708,15 @@ async function handleModifyLFGCommand(interaction) {
     return;
   }
 
-  const session = lfgSessions.get(sessionId);
-  if (!session) {
+  const sessionData = lfgSessions.get(sessionId);
+  if (!sessionData) {
     if (!interaction.replied && !interaction.deferred) {
       return interaction.reply({ content: `❌ Session ${sessionId} introuvable.`, ephemeral: true });
     }
     return;
   }
+
+  const session = { ...sessionData.value };
 
   try {
     await interaction.deferReply({ ephemeral: true });
@@ -673,9 +730,10 @@ async function handleModifyLFGCommand(interaction) {
     if (description) {
       session.description = description;
     }
-    lfgSessions.set(sessionId, session);
+    setWithTTL(lfgSessions, sessionId, session, CACHE_TTL);
 
-    const joinedUsers = lfgJoinedUsers.get(sessionId) || [];
+    const joinedUsersData = lfgJoinedUsers.get(sessionId);
+    const joinedUsers = joinedUsersData ? joinedUsersData.value : [];
 
     const hexColor = 0x1E90FF;
     const textTitle = new TextDisplayBuilder().setContent(`Session LFG ID-${sessionId}`);
@@ -795,13 +853,15 @@ async function handleListMembersCommand(interaction) {
   const sessionId = options.getString('session_id');
   const page = options.getInteger('page') || 1;
 
-  const session = lfgSessions.get(sessionId);
-  if (!session) {
+  const sessionData = lfgSessions.get(sessionId);
+  if (!sessionData) {
     if (!interaction.replied && !interaction.deferred) {
       return interaction.reply({ content: `❌ Session ${sessionId} introuvable.`, ephemeral: true });
     }
     return;
   }
+
+  const session = sessionData.value;
 
   try {
     await interaction.deferReply({ ephemeral: true });
@@ -854,13 +914,15 @@ async function handleKickMemberCommand(interaction) {
   const sessionId = options.getString('session_id');
   const targetMember = options.getMember('member');
 
-  const session = lfgSessions.get(sessionId);
-  if (!session) {
+  const sessionData = lfgSessions.get(sessionId);
+  if (!sessionData) {
     if (!interaction.replied && !interaction.deferred) {
       return interaction.reply({ content: `❌ Session ${sessionId} introuvable.`, flags: [MessageFlags.Ephemeral] });
     }
     return;
   }
+
+  const session = sessionData.value;
 
   if (user.id !== session.userId) {
     if (!interaction.replied && !interaction.deferred) {
@@ -875,8 +937,11 @@ async function handleKickMemberCommand(interaction) {
       await targetMember.voice.disconnect();
       const deleteUser = db.prepare('DELETE FROM lfgJoinedUsers WHERE sessionId = ? AND userId = ?');
       deleteUser.run(sessionId, targetMember.id);
-      const joinedUsers = lfgJoinedUsers.get(sessionId).filter(id => id !== targetMember.id);
-      lfgJoinedUsers.set(sessionId, joinedUsers);
+      const joinedUsersData = lfgJoinedUsers.get(sessionId);
+      if (joinedUsersData) {
+        const joinedUsers = joinedUsersData.value.filter(id => id !== targetMember.id);
+        setWithTTL(lfgJoinedUsers, sessionId, joinedUsers, CACHE_TTL);
+      }
       await saveData();
       await interaction.reply({ content: `✅ ${targetMember.user.tag} retiré de ${sessionId}.`, flags: [MessageFlags.Ephemeral] });
       updateRichPresence();
@@ -900,13 +965,15 @@ async function handleBanMemberCommand(interaction) {
   const sessionId = options.getString('session_id');
   const targetMember = options.getMember('member');
 
-  const session = lfgSessions.get(sessionId);
-  if (!session) {
+  const sessionData = lfgSessions.get(sessionId);
+  if (!sessionData) {
     if (!interaction.replied && !interaction.deferred) {
       return interaction.reply({ content: `❌ Session ${sessionId} introuvable.`, flags: [MessageFlags.Ephemeral] });
     }
     return;
   }
+
+  const session = sessionData.value;
 
   if (user.id !== session.userId) {
     if (!interaction.replied && !interaction.deferred) {
@@ -922,8 +989,11 @@ async function handleBanMemberCommand(interaction) {
       await guild.members.ban(targetMember, { reason: `Banni de la session LFG ${sessionId}` });
       const deleteUser = db.prepare('DELETE FROM lfgJoinedUsers WHERE sessionId = ? AND userId = ?');
       deleteUser.run(sessionId, targetMember.id);
-      const joinedUsers = lfgJoinedUsers.get(sessionId).filter(id => id !== targetMember.id);
-      lfgJoinedUsers.set(sessionId, joinedUsers);
+      const joinedUsersData = lfgJoinedUsers.get(sessionId);
+      if (joinedUsersData) {
+        const joinedUsers = joinedUsersData.value.filter(id => id !== targetMember.id);
+        setWithTTL(lfgJoinedUsers, sessionId, joinedUsers, CACHE_TTL);
+      }
       await saveData();
       await interaction.reply({ content: `✅ ${targetMember.user.tag} banni de ${sessionId}.`, flags: [MessageFlags.Ephemeral] });
       updateRichPresence();
@@ -989,7 +1059,7 @@ async function handleHistoryCommand(interaction) {
   try {
     await interaction.deferReply({ ephemeral: true });
 
-    const sessions = Array.from(lfgSessions.values());
+    const sessions = Array.from(lfgSessions.values()).map(data => data.value);
     const totalPages = Math.ceil(sessions.length / ITEMS_PER_PAGE);
     const start = (page - 1) * ITEMS_PER_PAGE;
     const end = start + ITEMS_PER_PAGE;
@@ -1049,7 +1119,7 @@ async function handleSetLFGChannelCommand(interaction) {
 
   try {
     await interaction.deferReply({ ephemeral: true });
-    webhookChannels.set(guild.id, channel.id);
+    setWithTTL(webhookChannels, guild.id, channel.id, WEBHOOK_TTL);
     await saveData();
     await interaction.followUp({ content: `✅ Salon ${channel} défini pour les annonces LFG.`, ephemeral: true });
   } catch (error) {
@@ -1068,8 +1138,8 @@ async function handleJoinButton(interaction) {
   const sessionId = customId.split('_')[1];
   console.log(`Tentative de rejoindre - customId: ${customId}, sessionId: ${sessionId}, lfgSessions:`, Array.from(lfgSessions.entries()));
 
-  const session = lfgSessions.get(sessionId);
-  if (!session) {
+  const sessionData = lfgSessions.get(sessionId);
+  if (!sessionData) {
     if (!interaction.replied && !interaction.deferred) {
       console.error(`Session ${sessionId} non trouvée dans lfgSessions`);
       return interaction.reply({ content: `❌ Session ${sessionId} introuvable. Vérifiez avec l'organisateur ou recréez la session.`, flags: [MessageFlags.Ephemeral] });
@@ -1077,7 +1147,10 @@ async function handleJoinButton(interaction) {
     return;
   }
 
-  const joinedUsers = lfgJoinedUsers.get(sessionId) || [];
+  const session = sessionData.value;
+
+  const joinedUsersData = lfgJoinedUsers.get(sessionId);
+  const joinedUsers = joinedUsersData ? joinedUsersData.value : [];
 
   if (joinedUsers.length >= session.players) {
     if (!interaction.replied && !interaction.deferred) {
@@ -1097,72 +1170,76 @@ async function handleJoinButton(interaction) {
     const voiceChannel = interaction.guild.channels.cache.get(session.voiceChannelId);
     if (voiceChannel) {
       joinedUsers.push(interaction.user.id);
-      lfgJoinedUsers.set(sessionId, joinedUsers);
+      setWithTTL(lfgJoinedUsers, sessionId, joinedUsers, CACHE_TTL);
       const insertUser = db.prepare('INSERT OR REPLACE INTO lfgJoinedUsers (sessionId, userId) VALUES (?, ?)');
       insertUser.run(sessionId, interaction.user.id);
       await saveData();
 
-      const infoTextChannel = interaction.guild.channels.cache.get(session.textChannelId);
-      if (infoTextChannel) {
-        const infoMessage = await infoTextChannel.messages.fetch(session.infoMessageId);
-        const hexColor = 0x1E90FF;
-        const textTitle = new TextDisplayBuilder().setContent(`Session LFG ID-${sessionId}`);
-        const textAuthor = new TextDisplayBuilder().setContent(`Nouvelle session LFG`);
-        const textFooter = new TextDisplayBuilder().setContent(`⚠️ Salon supprimé après 5 min si vide\n${interaction.guild.name} • /lfg • /stats • /history`);
+      const infoTextChannel = interaction.guild.channels.cache.get(session.infoTextChannelId);
+      if (infoTextChannel && session.infoMessageId) {
+        try {
+          const infoMessage = await infoTextChannel.messages.fetch(session.infoMessageId);
+          const hexColor = 0x1E90FF;
+          const textTitle = new TextDisplayBuilder().setContent(`Session LFG ID-${sessionId}`);
+          const textAuthor = new TextDisplayBuilder().setContent(`Nouvelle session LFG`);
+          const textFooter = new TextDisplayBuilder().setContent(`⚠️ Salon supprimé après 5 min si vide\n${interaction.guild.name} • /lfg • /stats • /history`);
 
-        const sectionThumbnail = new SectionBuilder()
-          .addTextDisplayComponents(textAuthor)
-          .addTextDisplayComponents(textTitle)
-          .setThumbnailAccessory(new ThumbnailBuilder({
-            media: { url: client.user.avatarURL({ dynamic: true }) || 'https://i.imgur.com/4AvpcjD.png' },
-          }));
+          const sectionThumbnail = new SectionBuilder()
+            .addTextDisplayComponents(textAuthor)
+            .addTextDisplayComponents(textTitle)
+            .setThumbnailAccessory(new ThumbnailBuilder({
+              media: { url: client.user.avatarURL({ dynamic: true }) || 'https://i.imgur.com/4AvpcjD.png' },
+            }));
 
-        const joinButton = new ButtonBuilder()
-          .setCustomId(`join_${sessionId}`)
-          .setLabel('Rejoindre la Session')
-          .setStyle(ButtonStyle.Primary);
+          const joinButton = new ButtonBuilder()
+            .setCustomId(`join_${sessionId}`)
+            .setLabel('Rejoindre la Session')
+            .setStyle(ButtonStyle.Primary);
 
-        const vocalButton = new ButtonBuilder()
-          .setCustomId(`vocal_${sessionId}`)
-          .setLabel('Rejoindre le Vocal')
-          .setStyle(ButtonStyle.Primary);
+          const vocalButton = new ButtonBuilder()
+            .setCustomId(`vocal_${sessionId}`)
+            .setLabel('Rejoindre le Vocal')
+            .setStyle(ButtonStyle.Primary);
 
-        const texteButton = new ButtonBuilder()
-          .setCustomId(`texte_${sessionId}`)
-          .setLabel('Salon Discution')
-          .setStyle(ButtonStyle.Primary);
+          const texteButton = new ButtonBuilder()
+            .setCustomId(`texte_${sessionId}`)
+            .setLabel('Salon Discution')
+            .setStyle(ButtonStyle.Primary);
 
-        const infoButton = new ButtonBuilder()
-          .setCustomId(`info_${sessionId}`)
-          .setLabel('Salon d\'information')
-          .setStyle(ButtonStyle.Primary);
+          const infoButton = new ButtonBuilder()
+            .setCustomId(`info_${sessionId}`)
+            .setLabel('Salon d\'information')
+            .setStyle(ButtonStyle.Primary);
 
-        const row = new ActionRowBuilder().addComponents(joinButton);
-        const buttonRow = new ActionRowBuilder().addComponents(vocalButton, texteButton, infoButton);
+          const row = new ActionRowBuilder().addComponents(joinButton);
+          const buttonRow = new ActionRowBuilder().addComponents(vocalButton, texteButton, infoButton);
 
-        const container = new ContainerBuilder()
-          .addSectionComponents(sectionThumbnail)
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👑 **Organisateur :** <@${session.userId}>`))
-          .addSeparatorComponents(new SeparatorBuilder())
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎮 **Jeu :** ${session.game}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`💻 **Plate-forme :** ${session.platform}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🏆 **Activité :** ${session.activity}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Joueurs :** ${session.players}/${session.players}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎯 **Gametag :** ${session.gametag}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`📝 **Description :** ${session.description}`))
-          .addSeparatorComponents(new SeparatorBuilder())
-          .addActionRowComponents(buttonRow)
-          .addSeparatorComponents(new SeparatorBuilder())
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Participants :** ${joinedUsers.map(id => `<@${id}>`).join(', ')}`))
-          .addTextDisplayComponents(textFooter)
-          .setAccentColor(hexColor)
-          .addActionRowComponents(row);
+          const container = new ContainerBuilder()
+            .addSectionComponents(sectionThumbnail)
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👑 **Organisateur :** <@${session.userId}>`))
+            .addSeparatorComponents(new SeparatorBuilder())
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎮 **Jeu :** ${session.game}`))
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(`💻 **Plate-forme :** ${session.platform}`))
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🏆 **Activité :** ${session.activity}`))
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Joueurs :** ${session.players}/${session.players}`))
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎯 **Gametag :** ${session.gametag}`))
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(`📝 **Description :** ${session.description}`))
+            .addSeparatorComponents(new SeparatorBuilder())
+            .addActionRowComponents(buttonRow)
+            .addSeparatorComponents(new SeparatorBuilder())
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Participants :** ${joinedUsers.map(id => `<@${id}>`).join(', ')}`))
+            .addTextDisplayComponents(textFooter)
+            .setAccentColor(hexColor)
+            .addActionRowComponents(row);
 
-        await infoMessage.edit({
-          flags: MessageFlags.IsComponentsV2,
-          components: [container],
-          allowedMentions: { parse: [] },
-        });
+          await infoMessage.edit({
+            flags: MessageFlags.IsComponentsV2,
+            components: [container],
+            allowedMentions: { parse: [] },
+          });
+        } catch (error) {
+          console.warn(`⚠️ Impossible de mettre à jour le message info:`, error.message);
+        }
       }
 
       await interaction.reply({ content: `✅ Session rejointe ! Cliquez pour rejoindre le salon vocal : ${voiceChannel}`, flags: [MessageFlags.Ephemeral] });
@@ -1212,14 +1289,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const [type, sessionId] = interaction.customId.split('_');
     console.log(`Bouton cliqué - type: ${type}, sessionId: ${sessionId}, lfgSessions:`, Array.from(lfgSessions.entries()));
 
-    const session = lfgSessions.get(sessionId);
-    if (!session) {
+    const sessionData = lfgSessions.get(sessionId);
+    if (!sessionData) {
       console.error(`Session ${sessionId} non trouvée dans lfgSessions`);
       if (!interaction.replied && !interaction.deferred) {
         return interaction.reply({ content: `❌ Session ${sessionId} introuvable. Vérifiez avec l'organisateur ou recréez la session.`, flags: [MessageFlags.Ephemeral] });
       }
       return;
     }
+
+    const session = sessionData.value;
 
     if (type === 'join') {
       return handleJoinButton(interaction);
@@ -1270,12 +1349,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
-  const sessionId = Array.from(lfgSessions.entries()).find(
-    ([id, session]) => session.voiceChannelId === oldState.channelId || session.voiceChannelId === newState.channelId
-  )?.[0];
+  const sessionData = Array.from(lfgSessions.entries()).find(
+    ([id, data]) => data.value.voiceChannelId === oldState.channelId || data.value.voiceChannelId === newState.channelId
+  );
 
-  if (sessionId) {
-    const voiceChannel = newState.guild.channels.cache.get(lfgSessions.get(sessionId).voiceChannelId);
+  if (sessionData) {
+    const sessionId = sessionData[0];
+    const session = sessionData[1].value;
+    const voiceChannel = newState.guild.channels.cache.get(session.voiceChannelId);
     if (voiceChannel) resetTimeout(sessionId, newState.guild);
   }
 });
@@ -1284,7 +1365,8 @@ client.once(Events.ClientReady, async () => {
   console.log(`✅ Connecté: ${client.user.tag}`);
   await loadData();
   console.log('Sessions après chargement:', Array.from(lfgSessions.entries()));
-  for (const [sessionId, session] of lfgSessions) {
+  for (const [sessionId, data] of lfgSessions) {
+    const session = data.value;
     const guild = client.guilds.cache.get(session.guildId);
     if (guild) {
       const voiceChannel = guild.channels.cache.get(session.voiceChannelId);
