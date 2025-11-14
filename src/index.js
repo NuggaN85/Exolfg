@@ -37,7 +37,7 @@ const client = new Client({
 });
 
 // Initialisation de la base de données SQLite
-const db = new Database('lfgData.db', { verbose: console.log });
+const db = new Database('lfgData.db');
 
 // Création des tables si elles n'existent pas
 db.exec(`
