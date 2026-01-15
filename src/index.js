@@ -20,6 +20,9 @@ import {
 } from 'discord.js';
 import Database from 'better-sqlite3';
 
+import path from 'path';
+import { fileURLToPath } from 'url';
+
 // Configuration des variables d'environnement
 dotenv.config();
 
@@ -40,7 +43,7 @@ const client = new Client({
 const db = new Database(path.join(__dirname, 'lfgData.db'), {
   verbose: process.env.NODE_ENV === 'development' ? console.log : null,
   fileMustExist: false,
-  timeout: 5000
+  timeout: 5000,
   readonly: false,
 });
 
@@ -174,6 +177,15 @@ async function loadData() {
     const sessions = db.prepare('SELECT * FROM lfgSessions').all();
     for (const session of sessions) {
       setWithTTL(lfgSessions, session.id, { ...session, timeoutId: null }, CACHE_TTL);
+      
+      // Recréer les timeouts pour les sessions existantes
+      const guild = client.guilds.cache.get(session.guildId);
+      if (guild) {
+        const voiceChannel = guild.channels.cache.get(session.voiceChannelId);
+        if (voiceChannel && voiceChannel.members.size === 0) {
+          resetTimeout(session.id, guild);
+        }
+      }
     }
     console.log('✅ Sessions chargées:', Array.from(lfgSessions.entries()));
 
@@ -644,33 +656,49 @@ async function handleLFGCommand(interaction) {
     });
 
     // Envoyer l'annonce à tous les serveurs sauf celui où la commande a été exécutée
-    for (const [guildId, data] of webhookChannels) {
-      const channelId = data.value;
-      if (guildId === guild.id) continue;
-      try {
-        const targetGuild = client.guilds.cache.get(guildId);
-        const targetChannel = targetGuild?.channels.cache.get(channelId);
-        if (targetChannel && targetChannel.isTextBased()) {
-          const webhook = await targetChannel.createWebhook({
-            name: 'LFG Annonce',
-            avatar: client.user.avatarURL(),
-          });
+for (const [guildId, data] of webhookChannels) {
+    const channelId = data.value;
+    if (guildId === guild.id) continue;
+    try {
+      const targetGuild = client.guilds.cache.get(guildId);
+      const targetChannel = targetGuild?.channels.cache.get(channelId);
+      if (targetChannel && targetChannel.isTextBased()) {
+        // Créer un container SANS les boutons d'interaction pour les autres serveurs
+        const announceContainer = new ContainerBuilder()
+          .addSectionComponents(sectionThumbnail)
+          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👑 **Organisateur :** ${user}`))
+          .addSeparatorComponents(new SeparatorBuilder())
+          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎮 **Jeu :** ${game}`))
+          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`💻 **Plate-forme :** ${platform}`))
+          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🏆 **Activité :** ${activity}`))
+          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Joueurs :** 1/${players}`))
+          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎯 **Gametag :** ${gametag}`))
+          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`📝 **Description :** ${description}`))
+          .addSeparatorComponents(new SeparatorBuilder())
+          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🌐 **Serveur :** ${guild.name}`))
+          .addTextDisplayComponents(textFooter)
+          .setAccentColor(hexColor);
 
-          await webhook.send({
-            components: [commandContainer],
-            flags: MessageFlags.IsComponentsV2,
-            username: client.user.username,
-            avatarURL: client.user.avatarURL(),
-            allowedMentions: { parse: [] },
-          });
+        const webhook = await targetChannel.createWebhook({
+          name: 'LFG Annonce',
+          avatar: client.user.avatarURL(),
+        });
 
-          await webhook.delete();
-          console.log(`✅ Annonce envoyée à ${targetChannel.name} sur ${targetGuild.name}`);
-        }
-      } catch (error) {
-        console.error(`⚠️ Erreur envoi annonce à ${guildId}:`, error);
+        await webhook.send({
+          components: [announceContainer],
+          flags: MessageFlags.IsComponentsV2,
+          username: client.user.username,
+          avatarURL: client.user.avatarURL(),
+          allowedMentions: { parse: [] },
+        });
+
+        await webhook.delete();
+        console.log(`✅ Annonce envoyée à ${targetChannel.name} sur ${targetGuild.name}`);
       }
+    } catch (error) {
+      console.error(`⚠️ Erreur envoi annonce à ${guildId}:`, error);
     }
+  }
 
     await interaction.followUp({ content: `✅ Session créée ! Voir ${textChannel} et ${infoTextChannel}.`, flags: [MessageFlags.Ephemeral] });
 
@@ -1384,14 +1412,30 @@ client.once(Events.ClientReady, async () => {
   console.log(`✅ Connecté: ${client.user.tag}`);
   await loadData();
   console.log('Sessions après chargement:', Array.from(lfgSessions.entries()));
+  
+  // Nettoyer les sessions dont les canaux n'existent plus
   for (const [sessionId, data] of lfgSessions) {
     const session = data.value;
     const guild = client.guilds.cache.get(session.guildId);
-    if (guild) {
-      const voiceChannel = guild.channels.cache.get(session.voiceChannelId);
-      if (voiceChannel && !voiceChannel.members.size) resetTimeout(sessionId, guild);
+    if (!guild) {
+      console.log(`⚠️ Serveur ${session.guildId} introuvable, suppression de la session ${sessionId}`);
+      lfgSessions.delete(sessionId);
+      lfgJoinedUsers.delete(sessionId);
+      continue;
+    }
+    
+    const voiceChannel = guild.channels.cache.get(session.voiceChannelId);
+    if (!voiceChannel) {
+      console.log(`⚠️ Canal vocal introuvable pour la session ${sessionId}, suppression`);
+      await deleteLFGSession(sessionId, guild);
+      continue;
+    }
+    
+    if (!voiceChannel.members.size) {
+      resetTimeout(sessionId, guild);
     }
   }
+  
   await registerCommands();
   updateRichPresence();
 });
