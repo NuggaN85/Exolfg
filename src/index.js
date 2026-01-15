@@ -37,7 +37,26 @@ const client = new Client({
 });
 
 // Initialisation de la base de données SQLite
-const db = new Database('lfgData.db');
+const db = new Database(path.join(__dirname, 'lfgData.db'), {
+  verbose: process.env.NODE_ENV === 'development' ? console.log : null,
+  fileMustExist: false,
+  timeout: 5000
+  readonly: false,
+});
+
+
+// Configuration optimisée
+db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+db.pragma('cache_size = -64000');        
+db.pragma('temp_store = MEMORY');
+db.pragma('foreign_keys = ON');
+db.pragma('mmap_size = 268435456');      
+db.pragma('page_size = 4096');          
+db.pragma('secure_delete = ON');        
+
+// Pour gérer la taille du fichier
+db.pragma('auto_vacuum = FULL');
 
 // Création des tables si elles n'existent pas
 db.exec(`
