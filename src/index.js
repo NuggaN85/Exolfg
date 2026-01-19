@@ -425,17 +425,27 @@ async function registerCommands() {
       description: 'Créer une session LFG',
       options: [
         { name: 'jeux', description: 'Jeu', type: 3, required: true, choices: gameChoices },
-        {
-          name: 'plateforme',
-          description: 'Plate-forme',
-          type: 3,
-          required: true,
-          choices: [
-            { name: 'PC', value: 'PC' },
-            { name: 'Console', value: 'Console' },
-            { name: 'Mobile', value: 'Mobile' },
-          ],
-        },
+{
+  name: 'plateforme',
+  description: 'Plate-forme',
+  type: 3,
+  required: true,
+  choices: [
+    { name: 'PC', value: 'PC' },
+    { name: 'PlayStation 5', value: 'PlayStation 5' },
+    { name: 'PlayStation 4', value: 'PlayStation 4' },
+    { name: 'Xbox Series X|S', value: 'Xbox Series X|S' },
+    { name: 'Xbox One', value: 'Xbox One' },
+    { name: 'Nintendo Switch', value: 'Nintendo Switch' },
+    { name: 'Mobile', value: 'Mobile' },
+    { name: 'iOS', value: 'iOS' },
+    { name: 'Android', value: 'Android' },
+    { name: 'Crossplay', value: 'Crossplay' },
+    { name: 'VR', value: 'VR' },
+    { name: 'Mac', value: 'Mac' },
+    { name: 'Linux', value: 'Linux' },
+  ],
+},
         { name: 'joueurs', description: 'Nombre de joueurs', type: 4, required: true, min_value: 1, max_value: 10 },
         { name: 'gametag', description: 'Gametag', type: 3, required: true },
 {
