@@ -47,19 +47,13 @@ const db = new Database(path.join(__dirname, 'lfgData.db'), {
   readonly: false,
 });
 
-
-// Configuration optimisée
-db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
-db.pragma('cache_size = -64000');        
-db.pragma('temp_store = MEMORY');
-db.pragma('foreign_keys = ON');
-db.pragma('mmap_size = 268435456');      
-db.pragma('page_size = 4096');          
-db.pragma('secure_delete = ON');        
-
-// Pour gérer la taille du fichier
-db.pragma('auto_vacuum = FULL');
+    // Configuration pragma optimisée
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    db.pragma('cache_size = -64000');
+    db.pragma('temp_store = MEMORY');
+    db.pragma('foreign_keys = ON');
+    db.pragma('busy_timeout = 5000');
 
 // Création des tables si elles n'existent pas
 db.exec(`
