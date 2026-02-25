@@ -16,6 +16,8 @@ import {
   SectionBuilder,
   TextDisplayBuilder,
   ThumbnailBuilder,
+  MediaGalleryBuilder,
+  MediaGalleryItemBuilder,
   SeparatorBuilder,
 } from 'discord.js';
 import Database from 'better-sqlite3';
@@ -96,23 +98,25 @@ db.exec(`
     guildId TEXT PRIMARY KEY,
     channelId TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS guildGameFilters (
+    guildId TEXT PRIMARY KEY,
+    games TEXT NOT NULL DEFAULT '[]'
+  );
 `);
 
 // ─── In-memory caches ─────────────────────────────────────────────────────────
-/** @type {Map<string, { value: object, expiresAt: number }>} */
 const lfgSessions     = new Map();
-/** @type {Map<string, { value: string[], expiresAt: number }>} */
 const lfgJoinedUsers  = new Map();
-/** @type {Map<string, { value: string, expiresAt: number }>} */
 const webhookChannels = new Map();
-/** @type {{ totalSessions: number, totalPlayers: number }} */
+const guildGameFilters = new Map();
 const lfgStats        = { totalSessions: 0, totalPlayers: 0 };
-/** @type {Record<string, number[]>} */
 const rateLimiter     = {};
 
-const SESSION_EXPIRY = 24 * 60 * 60 * 1000; // 24 h
-const CACHE_TTL      = 60 * 60 * 1000;       // 1 h
-const WEBHOOK_TTL    = 30 * 60 * 1000;       // 30 min
+const SESSION_EXPIRY = 24 * 60 * 60 * 1000;
+const CACHE_TTL      = 60 * 60 * 1000;
+const WEBHOOK_TTL    = 30 * 60 * 1000;
+const FILTER_TTL     = 60 * 60 * 1000;
 const ITEMS_PER_PAGE = 10;
 
 // ─── Game list ───────────────────────────────────────────────────────────────
@@ -146,15 +150,25 @@ const gameChoices = [
 
 // ─── Utility helpers ──────────────────────────────────────────────────────────
 
-/** Store a value in a Map with an expiry timestamp. */
 function setWithTTL(map, key, value, ttl) {
   map.set(key, { value, expiresAt: Date.now() + ttl });
 }
 
-/**
- * Safely delete a Discord channel, ignoring errors.
- * @param {import('discord.js').GuildChannel|null|undefined} channel
- */
+function getGuildGameFilter(guildId) {
+  const cached = guildGameFilters.get(guildId);
+  if (cached) return cached.value;
+
+  const row = db.prepare('SELECT games FROM guildGameFilters WHERE guildId = ?').get(guildId);
+  const games = row ? JSON.parse(row.games) : [];
+  setWithTTL(guildGameFilters, guildId, games, FILTER_TTL);
+  return games;
+}
+
+function isGameAllowedForGuild(guildId, game) {
+  const filter = getGuildGameFilter(guildId);
+  return filter.length === 0 || filter.includes(game);
+}
+
 async function safeDeleteChannel(channel) {
   if (!channel?.deletable) return;
   try {
@@ -165,42 +179,155 @@ async function safeDeleteChannel(channel) {
   }
 }
 
-/**
- * Build the standard session thumbnail section (shared across containers).
- * @param {string} label   - "Nouvelle session LFG" | "Session LFG modifiée" | …
- * @param {string} sessionId
- * @returns {SectionBuilder}
- */
-function buildThumbnailSection(label, sessionId) {
-  const thumbnail = new ThumbnailBuilder({
-    media: { url: client.user.avatarURL({ dynamic: true }) ?? 'https://i.imgur.com/4AvpcjD.png' },
-  });
-  return new SectionBuilder()
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(label))
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`Session LFG ID-${sessionId}`))
-    .setThumbnailAccessory(thumbnail);
-}
+// ─── Game image map ───────────────────────────────────────────────────────────
+// Remplis les URLs avec tes propres liens (imgur, CDN, hébergement perso…).
+// L'image sera affichée en grand via MediaGalleryBuilder juste après le header.
+// Si une URL est vide ('') ou absente, aucune image ne sera affichée.
+
+const gameImages = {
+  'League of Legends':        'https://i.imgur.com/mm0hV5B.jpeg',
+  'Valorant':                 'https://i.imgur.com/mm0hV5B.jpeg',
+  'Counter-Strike 2':         'https://i.imgur.com/mm0hV5B.jpeg',
+  'Dota 2':                   'https://i.imgur.com/mm0hV5B.jpeg',
+  'Apex Legends':             'https://i.imgur.com/mm0hV5B.jpeg',
+  'Rainbow Six: Siege':       'https://i.imgur.com/mm0hV5B.jpeg',
+  'Overwatch 2':              'https://i.imgur.com/mm0hV5B.jpeg',
+  'Fortnite':                 'https://i.imgur.com/mm0hV5B.jpeg',
+  'Rocket League':            'https://i.imgur.com/mm0hV5B.jpeg',
+  'COD: Warzone':             'https://i.imgur.com/mm0hV5B.jpeg',
+  'PUBG: Battlegrounds':      'https://i.imgur.com/mm0hV5B.jpeg',
+  'Hearthstone':              'https://i.imgur.com/mm0hV5B.jpeg',
+  'Teamfight Tactics':        'https://i.imgur.com/mm0hV5B.jpeg',
+  'Street Fighter 6':         'https://i.imgur.com/mm0hV5B.jpeg',
+  'Tekken 8':                 'https://i.imgur.com/mm0hV5B.jpeg',
+  'EA Sports FC 24':          'https://i.imgur.com/mm0hV5B.jpeg',
+  'StarCraft II':             'https://i.imgur.com/mm0hV5B.jpeg',
+  'Smite':                    'https://i.imgur.com/mm0hV5B.jpeg',
+  'Paladins':                 'https://i.imgur.com/mm0hV5B.jpeg',
+  'World of Warcraft':        'https://i.imgur.com/mm0hV5B.jpeg',
+  'Brawlhalla':               'https://i.imgur.com/mm0hV5B.jpeg',
+  'Albion Online':            'https://i.imgur.com/mm0hV5B.jpeg',
+  'The Finals':               'https://i.imgur.com/mm0hV5B.jpeg',
+  'Halo Infinite':            'https://i.imgur.com/mm0hV5B.jpeg',
+  'Mobile Legends: Bang Bang':'https://i.imgur.com/mm0hV5B.jpeg',
+};
 
 /**
- * Build the standard set of navigation buttons for a session.
- * @param {string} sessionId
- * @returns {{ row: ActionRowBuilder, buttonRow: ActionRowBuilder }}
+ * Retourne l'URL de l'image pour un jeu donné, ou null si non définie.
+ * @param {string} game
+ * @returns {string|null}
  */
-function buildSessionButtons(sessionId) {
-  const joinButton  = new ButtonBuilder().setCustomId(`join_${sessionId}`).setLabel('Rejoindre la Session').setStyle(ButtonStyle.Primary);
-  const vocalButton = new ButtonBuilder().setCustomId(`vocal_${sessionId}`).setLabel('Rejoindre le Vocal').setStyle(ButtonStyle.Primary);
-  const texteButton = new ButtonBuilder().setCustomId(`texte_${sessionId}`).setLabel('Salon Discussion').setStyle(ButtonStyle.Primary);
-  const infoButton  = new ButtonBuilder().setCustomId(`info_${sessionId}`).setLabel("Salon d'information").setStyle(ButtonStyle.Primary);
-  return {
-    row:       new ActionRowBuilder().addComponents(joinButton),
-    buttonRow: new ActionRowBuilder().addComponents(vocalButton, texteButton, infoButton),
+function getGameImageUrl(game) {
+  const url = gameImages[game];
+  return url && url.trim() !== '' ? url.trim() : null;
+}
+
+// ─── Improved embed builders ──────────────────────────────────────────────────
+
+/**
+ * Returns a platform emoji for a given platform string.
+ */
+function getPlatformEmoji(platform) {
+  const map = {
+    'PC': '🖥️', 'PlayStation 5': '🎮', 'PlayStation 4': '🎮',
+    'Xbox Series X|S': '🟩', 'Xbox One': '🟩', 'Nintendo Switch': '🔴',
+    'Mobile': '📱', 'iOS': '📱', 'Android': '📱',
+    'Crossplay': '🌐', 'VR': '🥽', 'Mac': '🍎', 'Linux': '🐧',
   };
+  return map[platform] ?? '🕹️';
 }
 
 /**
- * Build the full session ContainerBuilder.
- * @param {object} opts
- * @returns {ContainerBuilder}
+ * Returns an activity emoji.
+ */
+function getActivityEmoji(activity) {
+  const map = {
+    'Normale': '🎲', 'Classé': '🏆', 'Compétitif': '⚔️',
+    'Tournoi': '🏅', 'Scrim': '🎯', 'Entraînement': '📚',
+    'Fun': '😄', 'Découverte': '🔭', 'Arcade': '🕹️',
+    'Coopération': '🤝', 'Speedrun': '⚡', 'PvE': '🐉',
+    'PvP': '⚔️', 'Raids': '🗡️', 'Dungeons': '🏰',
+  };
+  return map[activity] ?? '🎮';
+}
+
+/**
+ * Build the header section — sans thumbnail (image gérée via MediaGallery).
+ * @param {string} label
+ * @param {string} sessionId
+ * @param {string} statusEmoji
+ */
+function buildHeaderSection(label, sessionId, statusEmoji = '🟢') {
+  // SectionBuilder exige un accessoire (Thumbnail ou Button) — on utilise
+  // de simples TextDisplayBuilder ajoutés directement au ContainerBuilder.
+  return [
+    new TextDisplayBuilder().setContent(`${statusEmoji} **${label}**`),
+    new TextDisplayBuilder().setContent(`\`🆔 Session #${sessionId}\``),
+  ];
+}
+
+/**
+ * Build a MediaGalleryBuilder with a single game image.
+ * Returns null if no image URL is defined for this game.
+ * @param {string} game
+ * @returns {MediaGalleryBuilder|null}
+ */
+function buildGameImageGallery(game) {
+  const url = getGameImageUrl(game);
+  if (!url) return null;
+  return new MediaGalleryBuilder().addItems(
+    new MediaGalleryItemBuilder().setURL(url)
+  );
+}
+
+/**
+ * Build navigation buttons row (vocal, texte, info).
+ */
+function buildNavButtons(sessionId) {
+  const vocalButton = new ButtonBuilder().setCustomId(`vocal_${sessionId}`).setLabel('🔊 Vocal').setStyle(ButtonStyle.Secondary);
+  const texteButton = new ButtonBuilder().setCustomId(`texte_${sessionId}`).setLabel('💬 Discussion').setStyle(ButtonStyle.Secondary);
+  const infoButton  = new ButtonBuilder().setCustomId(`info_${sessionId}`).setLabel('📢 Infos').setStyle(ButtonStyle.Secondary);
+  return new ActionRowBuilder().addComponents(vocalButton, texteButton, infoButton);
+}
+
+/**
+ * Build the main join button row.
+ */
+function buildJoinButton(sessionId) {
+  const joinButton = new ButtonBuilder()
+    .setCustomId(`join_${sessionId}`)
+    .setLabel('✅ Rejoindre la session')
+    .setStyle(ButtonStyle.Success);
+  return new ActionRowBuilder().addComponents(joinButton);
+}
+
+/**
+ * Build the full session ContainerBuilder — improved layout.
+ *
+ * Layout structure:
+ * ┌─────────────────────────────────────────┐
+ * │ [HEADER] Label + Session ID             │
+ * ├─────────────────────────────────────────┤
+ * │ [IMAGE DU JEU — MediaGallery]           │
+ * ├─────────────────────────────────────────┤
+ * │ 👑 Organisateur                         │
+ * ├── jeu & plateforme ─────────────────────┤
+ * │ 🎮 Jeu          💻 Plateforme           │
+ * │ 🏆 Activité     👥 Joueurs X/Y          │
+ * │ 🎯 Gametag                              │
+ * ├── description ──────────────────────────┤
+ * │ 📝 Description                          │
+ * ├── participants ─────────────────────────┤
+ * │ 👥 Participants                         │
+ * ├── twitch (optionnel) ───────────────────┤
+ * │ 🟣 Stream Twitch                        │
+ * ├── boutons navigation ───────────────────┤
+ * │ [🔊 Vocal] [💬 Discussion] [📢 Infos]  │
+ * ├── bouton rejoindre ─────────────────────┤
+ * │ [✅ Rejoindre la session]               │
+ * ├── footer ───────────────────────────────┤
+ * │ ⏱️ Expire si vide · Serveur · cmds      │
+ * └─────────────────────────────────────────┘
  */
 function buildSessionContainer({
   sessionId,
@@ -214,36 +341,188 @@ function buildSessionContainer({
   maxPlayers,
   gametag,
   description,
+  twitchUrl = null,
   participantsMention,
   includeJoinButton = true,
   includeNavButtons = true,
+  isModified = false,
 }) {
-  const hexColor       = 0x1E90FF;
-  const sectionThumb   = buildThumbnailSection(label, sessionId);
-  const { row, buttonRow } = buildSessionButtons(sessionId);
-  const textFooter = new TextDisplayBuilder().setContent(
-    `⚠️ Salon supprimé après 5 min si vide\n${guildName} • /lfg • /stats • /history`
-  );
+  const hexColor    = 0x1E90FF;
+  const statusEmoji = isModified ? '🔄' : '🟢';
+  const isFull      = joinedCount >= maxPlayers;
+  const slotDisplay = isFull ? `~~${joinedCount}/${maxPlayers}~~ **COMPLET**` : `${joinedCount}/${maxPlayers}`;
+  const platEmoji   = getPlatformEmoji(platform);
+  const actEmoji    = getActivityEmoji(activity);
+  const gameGallery = buildGameImageGallery(game);
 
+  const [headerTitle, headerId] = buildHeaderSection(label, sessionId, statusEmoji);
   const container = new ContainerBuilder()
-    .addSectionComponents(sectionThumb)
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👑 **Organisateur :** ${organizerMention}`))
+    // ── Header ───────────────────────────────────────────────────────────────
+    .addTextDisplayComponents(headerTitle)
+    .addTextDisplayComponents(headerId)
+    .addSeparatorComponents(new SeparatorBuilder());
+
+  // ── Image du jeu (MediaGallery, juste après le header) ───────────────────
+  if (gameGallery) container.addMediaGalleryComponents(gameGallery);
+
+  container
+
+    // ── Organisateur ─────────────────────────────────────────────────────────
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`👑 **Organisateur :** ${organizerMention}`)
+    )
     .addSeparatorComponents(new SeparatorBuilder())
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎮 **Jeu :** ${game}`))
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`💻 **Plate-forme :** ${platform}`))
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🏆 **Activité :** ${activity}`))
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Joueurs :** ${joinedCount}/${maxPlayers}`))
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎯 **Gametag :** ${gametag}`))
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`📝 **Description :** ${description}`))
+
+    // ── Infos jeu (regroupées sur 2 lignes compactes) ─────────────────────────
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        `🎮 **${game}**  ·  ${platEmoji} ${platform}`
+      )
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        `${actEmoji} **${activity}**  ·  👥 **Joueurs :** ${slotDisplay}`
+      )
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`🎯 **Gametag :** \`${gametag}\``)
+    )
     .addSeparatorComponents(new SeparatorBuilder())
+
+    // ── Description ───────────────────────────────────────────────────────────
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`> 📝 ${description}`)
+    )
+
     .setAccentColor(hexColor);
 
-  if (includeNavButtons) container.addActionRowComponents(buttonRow).addSeparatorComponents(new SeparatorBuilder());
+  // ── Participants (optionnel, affiché dans le salon info) ──────────────────
   if (participantsMention !== undefined) {
-    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Participants :** ${participantsMention}`));
+    container
+      .addSeparatorComponents(new SeparatorBuilder())
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(`👥 **Participants :** ${participantsMention}`)
+      );
   }
-  container.addTextDisplayComponents(textFooter);
-  if (includeJoinButton) container.addActionRowComponents(row);
+
+  // ── Stream Twitch (optionnel) ─────────────────────────────────────────────
+  if (twitchUrl) {
+    container
+      .addSeparatorComponents(new SeparatorBuilder())
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(
+          `🟣 **Live Twitch :** [${twitchUrl.replace('https://twitch.tv/', '')}](${twitchUrl})`
+        )
+      );
+  }
+
+  // ── Boutons de navigation ─────────────────────────────────────────────────
+  if (includeNavButtons) {
+    container
+      .addSeparatorComponents(new SeparatorBuilder())
+      .addActionRowComponents(buildNavButtons(sessionId));
+  }
+
+  // ── Bouton rejoindre ──────────────────────────────────────────────────────
+  if (includeJoinButton) {
+    container.addActionRowComponents(buildJoinButton(sessionId));
+  }
+
+  // ── Footer ────────────────────────────────────────────────────────────────
+  container
+    .addSeparatorComponents(new SeparatorBuilder())
+    .addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      `-# ⏱️ Salon supprimé après 5 min si vide  ·  ${guildName}  ·  /lfg  /stats  /history`
+    )
+  );
+
+  return container;
+}
+
+// ─── Cross-server container ───────────────────────────────────────────────────
+
+/**
+ * Build a cross-server announcement container — improved layout showing
+ * origin server clearly and without join button (read-only announcement).
+ */
+function buildCrossServerContainer({
+  sessionId,
+  sourceGuildName,
+  organizerTag,
+  game,
+  platform,
+  activity,
+  joinedCount,
+  maxPlayers,
+  gametag,
+  description,
+  twitchUrl,
+}) {
+  const platEmoji   = getPlatformEmoji(platform);
+  const actEmoji    = getActivityEmoji(activity);
+  const gameGallery = buildGameImageGallery(game);
+
+  const container = new ContainerBuilder()
+    // ── Header (TextDisplay, pas de SectionBuilder sans accessoire) ───────────
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`📡 **Session LFG — Annonce externe**`))
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`\`🆔 Session #${sessionId}\``))
+    .addSeparatorComponents(new SeparatorBuilder());
+
+  // ── Image du jeu (MediaGallery, juste après le header) ───────────────────
+  if (gameGallery) container.addMediaGalleryComponents(gameGallery);
+
+  container
+
+    // ── Serveur source bien mis en avant ─────────────────────────────────────
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`🌐 **Serveur d'origine :** ${sourceGuildName}`)
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`👑 **Organisateur :** ${organizerTag}`)
+    )
+    .addSeparatorComponents(new SeparatorBuilder())
+
+    // ── Infos jeu ─────────────────────────────────────────────────────────────
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`🎮 **${game}**  ·  ${platEmoji} ${platform}`)
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`${actEmoji} **${activity}**  ·  👥 **Joueurs :** ${joinedCount}/${maxPlayers}`)
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`🎯 **Gametag :** \`${gametag}\``)
+    )
+    .addSeparatorComponents(new SeparatorBuilder())
+
+    // ── Description ───────────────────────────────────────────────────────────
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`> 📝 ${description}`)
+    );
+
+  if (twitchUrl) {
+    container
+      .addSeparatorComponents(new SeparatorBuilder())
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(
+          `🟣 **Live Twitch :** [${twitchUrl.replace('https://twitch.tv/', '')}](${twitchUrl})`
+        )
+      );
+  }
+
+  container
+    .addSeparatorComponents(new SeparatorBuilder())
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        `> ⚠️ *Cette session est hébergée sur **${sourceGuildName}**.\nRejoignez ce serveur pour y participer.*`
+      )
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        `-# ${sourceGuildName}  ·  /lfg  /stats  /history`
+      )
+    )
+    .setAccentColor(0x1E90FF);
 
   return container;
 }
@@ -287,10 +566,10 @@ async function saveData() {
     const deleteUsers  = db.prepare('DELETE FROM lfgJoinedUsers WHERE sessionId = ?');
     const updateStats  = db.prepare('INSERT OR REPLACE INTO lfgStats (id, totalSessions, totalPlayers) VALUES (1, ?, ?)');
     const insertWebhook = db.prepare('INSERT OR REPLACE INTO webhookChannels (guildId, channelId) VALUES (?, ?)');
+    const insertFilter  = db.prepare('INSERT OR REPLACE INTO guildGameFilters (guildId, games) VALUES (?, ?)');
 
     db.transaction(() => {
       for (const [id, data] of lfgSessions) {
-        // eslint-disable-next-line no-unused-vars
         const { timeoutId, ...s } = data.value;
         insertSession.run(id, s.userId, s.user, s.game, s.platform, s.activity, s.gametag,
           s.description, s.date, s.players, s.categoryId, s.voiceChannelId, s.textChannelId,
@@ -302,6 +581,7 @@ async function saveData() {
       }
       updateStats.run(lfgStats.totalSessions, lfgStats.totalPlayers);
       for (const [guildId, data] of webhookChannels) insertWebhook.run(guildId, data.value);
+      for (const [guildId, data] of guildGameFilters) insertFilter.run(guildId, JSON.stringify(data.value));
     })();
 
     console.log('✅ Données sauvegardées.');
@@ -377,15 +657,15 @@ async function loadData() {
         existing.value.push(u.userId);
       }
     }
-    console.log(`✅ ${users.length} utilisateur(s) chargé(s).`);
 
     const stats = db.prepare('SELECT totalSessions, totalPlayers FROM lfgStats LIMIT 1').get() ?? { totalSessions: 0, totalPlayers: 0 };
     Object.assign(lfgStats, stats);
-    console.log('✅ Stats chargées:', lfgStats);
 
     const webhooks = db.prepare('SELECT guildId, channelId FROM webhookChannels').all();
     for (const w of webhooks) setWithTTL(webhookChannels, w.guildId, w.channelId, WEBHOOK_TTL);
-    console.log(`✅ ${webhooks.length} webhook(s) chargé(s).`);
+
+    const filters = db.prepare('SELECT guildId, games FROM guildGameFilters').all();
+    for (const f of filters) setWithTTL(guildGameFilters, f.guildId, JSON.parse(f.games), FILTER_TTL);
   } catch (err) {
     console.error('⚠️ Erreur chargement données:', err.message);
   }
@@ -437,7 +717,8 @@ async function registerCommands() {
         { name: 'joueurs',     description: 'Nombre de joueurs',     type: 4, required: true, min_value: 1, max_value: 10 },
         { name: 'gametag',     description: 'Gametag',               type: 3, required: true },
         { name: 'activite',    description: 'Activité',              type: 3, required: true, choices: activityChoices },
-        { name: 'description', description: 'Description',           type: 3, required: false },
+        { name: 'description', description: 'Description (optionnel)',           type: 3, required: false },
+        { name: 'twitch',      description: 'Lien Twitch (optionnel)',           type: 3, required: false },
       ],
     },
     {
@@ -474,18 +755,37 @@ async function registerCommands() {
       ],
     },
     { name: 'stats',   description: 'Afficher les statistiques des sessions LFG' },
-    {
-      name: 'history',
-      description: "Afficher l'historique des sessions LFG",
-      options: [
-        { name: 'page', description: "Page de l'historique", type: 4, required: false, min_value: 1 },
-      ],
-    },
+    { name: 'history', description: "Afficher l'historique des sessions LFG" },
     {
       name: 'set_lfg_channel',
       description: 'Définir le salon pour les annonces LFG',
       options: [
         { name: 'channel', description: 'Salon pour les annonces', type: 7, required: true, channel_types: [ChannelType.GuildText] },
+      ],
+    },
+    {
+      name: 'config',
+      description: 'Configurer les jeux acceptés sur ce serveur',
+      options: [
+        {
+          name: 'action',
+          description: 'Action à effectuer',
+          type: 3,
+          required: true,
+          choices: [
+            { name: 'Ajouter un jeu au filtre',    value: 'add' },
+            { name: 'Retirer un jeu du filtre',    value: 'remove' },
+            { name: 'Voir la configuration',       value: 'view' },
+            { name: 'Réinitialiser (tout accepter)', value: 'reset' },
+          ],
+        },
+        {
+          name: 'jeu',
+          description: 'Jeu à ajouter ou retirer du filtre',
+          type: 3,
+          required: false,
+          choices: gameChoices,
+        },
       ],
     },
   ];
@@ -515,12 +815,29 @@ async function handleLFGCommand(interaction) {
   const gametag     = options.getString('gametag');
   const activity    = options.getString('activite');
   const description = options.getString('description') ?? 'Pas de description';
+  const twitchRaw   = options.getString('twitch');
   const sessionId   = Math.floor(1000 + Math.random() * 9000).toString();
+
+  const TWITCH_REGEX = /^https?:\/\/(www\.)?twitch\.tv\/[a-zA-Z0-9_]{1,25}\/?$/;
+  if (twitchRaw && !TWITCH_REGEX.test(twitchRaw.trim())) {
+    return interaction.reply({
+      content: '❌ Le lien Twitch est invalide.\n✅ Format attendu : `https://twitch.tv/nomduchaine`',
+      flags: [MessageFlags.Ephemeral],
+    });
+  }
+  const twitchUrl = twitchRaw ? twitchRaw.trim().replace(/\/$/, '') : null;
+
+  if (!isGameAllowedForGuild(guild.id, game)) {
+    const filter = getGuildGameFilter(guild.id);
+    return interaction.reply({
+      content: `❌ Ce serveur n'accepte pas les sessions LFG pour **${game}**.\n📋 Jeux autorisés : ${filter.map(g => `\`${g}\``).join(', ')}`,
+      flags: [MessageFlags.Ephemeral],
+    });
+  }
 
   await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
   try {
-    // ── Create Discord channels ──────────────────────────────────────────────
     const category = await guild.channels.create({
       name: `🎮-${sessionId}-LFG`,
       type: ChannelType.GuildCategory,
@@ -541,7 +858,7 @@ async function handleLFGCommand(interaction) {
     });
 
     await textChannel.send({
-      content: `Bienvenue dans le salon de discussion pour la session LFG ${sessionId} !`,
+      content: `👋 Bienvenue dans le salon de discussion de la session **#${sessionId}** !\n> Organisateur : <@${user.id}>`,
       allowedMentions: { parse: [] },
     });
 
@@ -566,7 +883,6 @@ async function handleLFGCommand(interaction) {
       ],
     });
 
-    // ── Build containers ─────────────────────────────────────────────────────
     const commonOpts = {
       sessionId,
       guildName: guild.name,
@@ -578,21 +894,26 @@ async function handleLFGCommand(interaction) {
       maxPlayers: players,
       gametag,
       description,
+      twitchUrl,
     };
 
+    // ── Salon info : avec participants + bouton rejoindre + nav ───────────────
     const infoContainer = buildSessionContainer({
       ...commonOpts,
       label: 'Nouvelle session LFG',
       participantsMention: `<@${user.id}>`,
+      includeJoinButton: true,
+      includeNavButtons: true,
     });
 
+    // ── Salon commande : sans bouton rejoindre (lecture seule) ────────────────
     const commandContainer = buildSessionContainer({
       ...commonOpts,
       label: 'Nouvelle session LFG',
       includeJoinButton: false,
+      includeNavButtons: true,
     });
 
-    // ── Send messages ────────────────────────────────────────────────────────
     const infoMessage = await infoTextChannel.send({
       flags: MessageFlags.IsComponentsV2,
       components: [infoContainer],
@@ -601,7 +922,7 @@ async function handleLFGCommand(interaction) {
     await infoMessage.pin();
 
     await infoTextChannel.send({
-      content: `Bienvenue dans le salon d'information pour la session LFG ${sessionId} !`,
+      content: `📢 Salon d'information pour la session **#${sessionId}** — utilisez les boutons ci-dessus.`,
       allowedMentions: { parse: [] },
     });
 
@@ -612,43 +933,33 @@ async function handleLFGCommand(interaction) {
     });
 
     // ── Cross-server announcements ───────────────────────────────────────────
-    // joinedUsers for this brand-new session = [user.id] (1 member)
     const initialJoinedUsers = [user.id];
 
     for (const [guildId, webhookData] of webhookChannels) {
       if (guildId === guild.id) continue;
+      if (!isGameAllowedForGuild(guildId, game)) {
+        console.log(`⏭️ Annonce filtrée pour ${guildId} (jeu "${game}" non autorisé).`);
+        continue;
+      }
+
       try {
         const targetGuild   = client.guilds.cache.get(guildId);
         const targetChannel = targetGuild?.channels.cache.get(webhookData.value);
         if (!targetChannel?.isTextBased()) continue;
 
-        const announceContainer = buildSessionContainer({
-          ...commonOpts,
-          label: 'Nouvelle session LFG',
-          organizerMention: `${user.tag}`,          // No ping on foreign servers
+        const crossContainer = buildCrossServerContainer({
+          sessionId,
+          sourceGuildName: guild.name,
+          organizerTag: user.tag,
+          game,
+          platform,
+          activity,
           joinedCount: initialJoinedUsers.length,
-          includeJoinButton: false,
-          includeNavButtons: false,
-          participantsMention: undefined,
+          maxPlayers: players,
+          gametag,
+          description,
+          twitchUrl,
         });
-        // Add server origin line
-        const sectionThumb = buildThumbnailSection('Nouvelle session LFG', sessionId);
-        const crossContainer = new ContainerBuilder()
-          .addSectionComponents(sectionThumb)
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👑 **Organisateur :** ${user.tag}`))
-          .addSeparatorComponents(new SeparatorBuilder())
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎮 **Jeu :** ${game}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`💻 **Plate-forme :** ${platform}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🏆 **Activité :** ${activity}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Joueurs :** ${initialJoinedUsers.length}/${players}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎯 **Gametag :** ${gametag}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`📝 **Description :** ${description}`))
-          .addSeparatorComponents(new SeparatorBuilder())
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🌐 **Serveur :** ${guild.name}`))
-          .addTextDisplayComponents(new TextDisplayBuilder().setContent(
-            `⚠️ Session hébergée sur un autre serveur\n${guild.name} • /lfg • /stats • /history`
-          ))
-          .setAccentColor(0x1E90FF);
 
         const webhook = await targetChannel.createWebhook({ name: 'LFG Annonce', avatar: client.user.avatarURL() });
         await webhook.send({
@@ -665,11 +976,10 @@ async function handleLFGCommand(interaction) {
       }
     }
 
-    // ── Persist session ──────────────────────────────────────────────────────
     const sessionData = {
       userId: user.id,
       user: user.tag,
-      game, platform, activity, gametag, description,
+      game, platform, activity, gametag, description, twitchUrl,
       date: new Date().toISOString(),
       players,
       categoryId: category.id,
@@ -693,7 +1003,7 @@ async function handleLFGCommand(interaction) {
     updateRichPresence();
 
     await interaction.followUp({
-      content: `✅ Session **${sessionId}** créée ! Voir ${textChannel} et ${infoTextChannel}.`,
+      content: `✅ Session **#${sessionId}** créée avec succès !\n> 💬 ${textChannel} · 📢 ${infoTextChannel}`,
       flags: [MessageFlags.Ephemeral],
     });
   } catch (err) {
@@ -737,6 +1047,7 @@ async function handleModifyLFGCommand(interaction) {
 
     const joinedUsers = lfgJoinedUsers.get(sessionId)?.value ?? [];
     const participantsMention = joinedUsers.length ? joinedUsers.map(id => `<@${id}>`).join(', ') : 'Aucun';
+
     const commonOpts = {
       sessionId,
       guildName: guild.name,
@@ -748,16 +1059,22 @@ async function handleModifyLFGCommand(interaction) {
       maxPlayers: session.players,
       gametag: session.gametag,
       description: session.description,
+      isModified: true,
     };
 
-    // Update info channel message
     const infoTextChannel = guild.channels.cache.get(session.infoTextChannelId);
     if (infoTextChannel && session.infoMessageId) {
       try {
         const infoMessage = await infoTextChannel.messages.fetch(session.infoMessageId);
         await infoMessage.edit({
           flags: MessageFlags.IsComponentsV2,
-          components: [buildSessionContainer({ ...commonOpts, label: 'Session LFG modifiée', participantsMention })],
+          components: [buildSessionContainer({
+            ...commonOpts,
+            label: 'Session LFG modifiée',
+            participantsMention,
+            includeJoinButton: true,
+            includeNavButtons: true,
+          })],
           allowedMentions: { parse: [] },
         });
       } catch (err) {
@@ -765,14 +1082,18 @@ async function handleModifyLFGCommand(interaction) {
       }
     }
 
-    // Update command channel message
     const commandChannel = guild.channels.cache.get(session.commandChannelId);
     if (commandChannel && session.commandChannelMessageId) {
       try {
         const commandMessage = await commandChannel.messages.fetch(session.commandChannelMessageId);
         await commandMessage.edit({
           flags: MessageFlags.IsComponentsV2,
-          components: [buildSessionContainer({ ...commonOpts, label: 'Session LFG modifiée', includeJoinButton: false })],
+          components: [buildSessionContainer({
+            ...commonOpts,
+            label: 'Session LFG modifiée',
+            includeJoinButton: false,
+            includeNavButtons: true,
+          })],
           allowedMentions: { parse: [] },
         });
       } catch (err) {
@@ -781,7 +1102,7 @@ async function handleModifyLFGCommand(interaction) {
     }
 
     await saveData();
-    await interaction.followUp({ content: `✅ Session **${sessionId}** modifiée.`, flags: [MessageFlags.Ephemeral] });
+    await interaction.followUp({ content: `✅ Session **#${sessionId}** modifiée.`, flags: [MessageFlags.Ephemeral] });
     updateRichPresence();
   } catch (err) {
     console.error('⚠️ Erreur modification LFG:', err);
@@ -803,25 +1124,44 @@ async function handleListMembersCommand(interaction) {
   await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
   try {
-    const voiceChannel = interaction.guild.channels.cache.get(sessionData.value.voiceChannelId);
+    const session      = sessionData.value;
+    const voiceChannel = interaction.guild.channels.cache.get(session.voiceChannelId);
     const members      = voiceChannel?.members.map(m => m.user.tag) ?? [];
     const start        = (page - 1) * ITEMS_PER_PAGE;
     const pageItems    = members.slice(start, start + ITEMS_PER_PAGE);
     const totalPages   = Math.max(1, Math.ceil(members.length / ITEMS_PER_PAGE));
+    const joinedData   = lfgJoinedUsers.get(sessionId)?.value ?? [];
 
-    const sectionThumb = buildThumbnailSection('Liste des membres', sessionId);
+    const thumbnail = new ThumbnailBuilder({
+      media: { url: interaction.guild.iconURL({ dynamic: true }) ?? 'https://i.imgur.com/Xo1BHdr.png' },
+    });
+
+    const headerSection = new SectionBuilder()
+      .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Membres de la session**`))
+      .addTextDisplayComponents(new TextDisplayBuilder().setContent(`\`🆔 Session #${sessionId}\``))
+      .setThumbnailAccessory(thumbnail);
+
+    const memberList = pageItems.length
+      ? pageItems.map((tag, i) => `\`${start + i + 1}.\` ${tag}`).join('\n')
+      : '_Aucun membre dans le salon vocal_';
+
     const container = new ContainerBuilder()
-      .addSectionComponents(sectionThumb)
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(
-        `👥 **Membres :**\n${pageItems.length ? pageItems.join('\n') : 'Aucun membre'}`
-      ))
+      .addSectionComponents(headerSection)
       .addSeparatorComponents(new SeparatorBuilder())
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(
-        `📊 **Total :** ${members.length} membre(s) | Page ${page}/${totalPages}`
-      ))
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(
-        `${interaction.guild.name} • /lfg • /stats • /history`
-      ))
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(`🔊 **Dans le vocal :**\n${memberList}`)
+      )
+      .addSeparatorComponents(new SeparatorBuilder())
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(
+          `📋 **Inscrits :** ${joinedData.length}/${session.players}  ·  🔊 **En vocal :** ${members.length}`
+        )
+      )
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(
+          `-# Page ${page}/${totalPages}  ·  ${interaction.guild.name}  ·  /lfg  /stats  /history`
+        )
+      )
       .setAccentColor(0x1E90FF);
 
     await interaction.followUp({ components: [container], flags: [MessageFlags.IsComponentsV2, MessageFlags.Ephemeral] });
@@ -856,7 +1196,7 @@ async function handleKickMemberCommand(interaction) {
     const jud = lfgJoinedUsers.get(sessionId);
     if (jud) setWithTTL(lfgJoinedUsers, sessionId, jud.value.filter(id => id !== targetMember.id), CACHE_TTL);
     await saveData();
-    await interaction.reply({ content: `✅ **${targetMember.user.tag}** retiré de la session ${sessionId}.`, flags: [MessageFlags.Ephemeral] });
+    await interaction.reply({ content: `✅ **${targetMember.user.tag}** retiré de la session **#${sessionId}**.`, flags: [MessageFlags.Ephemeral] });
     updateRichPresence();
   } catch (err) {
     console.error('⚠️ Erreur kick membre:', err);
@@ -892,7 +1232,7 @@ async function handleBanMemberCommand(interaction) {
     const jud = lfgJoinedUsers.get(sessionId);
     if (jud) setWithTTL(lfgJoinedUsers, sessionId, jud.value.filter(id => id !== targetMember.id), CACHE_TTL);
     await saveData();
-    await interaction.reply({ content: `✅ **${targetMember.user.tag}** banni de la session ${sessionId}.`, flags: [MessageFlags.Ephemeral] });
+    await interaction.reply({ content: `✅ **${targetMember.user.tag}** banni de la session **#${sessionId}**.`, flags: [MessageFlags.Ephemeral] });
     updateRichPresence();
   } catch (err) {
     console.error('⚠️ Erreur ban membre:', err);
@@ -907,22 +1247,43 @@ async function handleBanMemberCommand(interaction) {
 async function handleStatsCommand(interaction) {
   await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
   try {
-    const sectionThumb = buildThumbnailSection('Statistiques', 'global');
-    // Override thumbnail media with guild icon
-    const sectionThumbGuild = new SectionBuilder()
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent('Résumé des sessions'))
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent('Statistiques LFG'))
-      .setThumbnailAccessory(new ThumbnailBuilder({
-        media: { url: interaction.guild.iconURL({ dynamic: true }) ?? 'https://i.imgur.com/4AvpcjD.png' },
-      }));
+    const activePlayers = Array.from(lfgJoinedUsers.values()).reduce((acc, d) => acc + (d.value?.length ?? 0), 0);
+
+    const thumbnail = new ThumbnailBuilder({
+      media: { url: interaction.guild.iconURL({ dynamic: true }) ?? 'https://i.imgur.com/Xo1BHdr.png' },
+    });
+
+    const headerSection = new SectionBuilder()
+      .addTextDisplayComponents(new TextDisplayBuilder().setContent(`📊 **Statistiques LFG**`))
+      .addTextDisplayComponents(new TextDisplayBuilder().setContent(interaction.guild.name))
+      .setThumbnailAccessory(thumbnail);
 
     const container = new ContainerBuilder()
-      .addSectionComponents(sectionThumbGuild)
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(`📊 **Sessions créées :** ${lfgStats.totalSessions}`))
+      .addSectionComponents(headerSection)
       .addSeparatorComponents(new SeparatorBuilder())
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(`👥 **Joueurs totaux :** ${lfgStats.totalPlayers}`))
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(`🎮 **Sessions actives :** ${lfgSessions.size}`))
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(`${interaction.guild.name} • /lfg • /stats • /history`))
+
+      // ── Stats globales ──────────────────────────────────────────────────────
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(`🗂️ **Sessions créées :** ${lfgStats.totalSessions}`)
+      )
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(`👥 **Joueurs totaux :** ${lfgStats.totalPlayers}`)
+      )
+      .addSeparatorComponents(new SeparatorBuilder())
+
+      // ── Stats en temps réel ─────────────────────────────────────────────────
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(`🟢 **Sessions actives :** ${lfgSessions.size}`)
+      )
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(`🎮 **Joueurs en session :** ${activePlayers}`)
+      )
+      .addSeparatorComponents(new SeparatorBuilder())
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(
+          `-# ${interaction.guild.name}  ·  /lfg  /stats  /history`
+        )
+      )
       .setAccentColor(0x1E90FF);
 
     await interaction.followUp({ components: [container], flags: [MessageFlags.IsComponentsV2, MessageFlags.Ephemeral] });
@@ -934,40 +1295,84 @@ async function handleStatsCommand(interaction) {
 
 // ──────────────────────────────────────────────────────────────────────────────
 
+// Pages d'historique en cours par utilisateur (userId → page courante)
+const historyPages = new Map();
+
+/**
+ * Construit et envoie (ou met à jour) l'embed historique pour une page donnée.
+ */
+async function sendHistoryEmbed(interaction, page, isUpdate = false) {
+  const sessions   = Array.from(lfgSessions.entries()).map(([id, d]) => ({ id, ...d.value }));
+  const totalPages = Math.max(1, Math.ceil(sessions.length / ITEMS_PER_PAGE));
+  const safePage   = Math.min(Math.max(1, page), totalPages);
+  const start      = (safePage - 1) * ITEMS_PER_PAGE;
+  const pageItems  = sessions.slice(start, start + ITEMS_PER_PAGE);
+
+  const thumbnail = new ThumbnailBuilder({
+    media: { url: client.user.avatarURL({ dynamic: true }) ?? 'https://i.imgur.com/Xo1BHdr.png' },
+  });
+
+  const headerSection = new SectionBuilder()
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`📜 **Historique des sessions**`))
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(interaction.guild.name))
+    .setThumbnailAccessory(thumbnail);
+
+  const historyLines = pageItems.length
+    ? pageItems.map(({ id, game, user, date }) => {
+        const ts = Math.floor(new Date(date).getTime() / 1000);
+        return `\`#${id}\` **${game}** · ${user} · <t:${ts}:R>`;
+      }).join('\n')
+    : '_Aucune session dans l\'historique._';
+
+  // ── Boutons de pagination ──────────────────────────────────────────────────
+  const prevBtn = new ButtonBuilder()
+    .setCustomId(`history_prev_${interaction.user.id}`)
+    .setLabel('◀ Retour')
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(safePage <= 1);
+
+  const pageBtn = new ButtonBuilder()
+    .setCustomId('history_page_noop')
+    .setLabel(`Page ${safePage} / ${totalPages}`)
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(true);
+
+  const nextBtn = new ButtonBuilder()
+    .setCustomId(`history_next_${interaction.user.id}`)
+    .setLabel('Suivant ▶')
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(safePage >= totalPages);
+
+  const paginationRow = new ActionRowBuilder().addComponents(prevBtn, pageBtn, nextBtn);
+
+  const container = new ContainerBuilder()
+    .addSectionComponents(headerSection)
+    .addSeparatorComponents(new SeparatorBuilder())
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(historyLines))
+    .addSeparatorComponents(new SeparatorBuilder())
+    .addActionRowComponents(paginationRow)
+    .addSeparatorComponents(new SeparatorBuilder())
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        `-# ${sessions.length} session(s) au total  ·  ${interaction.guild.name}  ·  /lfg  /stats  /history`
+      )
+    )
+    .setAccentColor(0x1E90FF);
+
+  const payload = { components: [container], flags: [MessageFlags.IsComponentsV2, MessageFlags.Ephemeral] };
+
+  if (isUpdate) {
+    await interaction.update(payload);
+  } else {
+    await interaction.followUp(payload);
+  }
+}
+
 async function handleHistoryCommand(interaction) {
-  const page = interaction.options.getInteger('page') ?? 1;
   await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-
   try {
-    const sessions    = Array.from(lfgSessions.values()).map(d => d.value);
-    const totalPages  = Math.max(1, Math.ceil(sessions.length / ITEMS_PER_PAGE));
-    const start       = (page - 1) * ITEMS_PER_PAGE;
-    const pageItems   = sessions.slice(start, start + ITEMS_PER_PAGE);
-
-    const sectionThumb = new SectionBuilder()
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent('Sessions récentes'))
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent('Historique des sessions LFG'))
-      .setThumbnailAccessory(new ThumbnailBuilder({
-        media: { url: client.user.avatarURL({ dynamic: true }) ?? 'https://i.imgur.com/4AvpcjD.png' },
-      }));
-
-    const container = new ContainerBuilder()
-      .addSectionComponents(sectionThumb)
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(
-        pageItems.length
-          ? pageItems.map(s => `🎮 **${s.game}** — ${s.user} — <t:${Math.floor(new Date(s.date).getTime() / 1000)}:R>`).join('\n')
-          : 'Aucune session.'
-      ))
-      .addSeparatorComponents(new SeparatorBuilder())
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(
-        `📊 **Total :** ${sessions.length} session(s) | Page ${page}/${totalPages}`
-      ))
-      .addTextDisplayComponents(new TextDisplayBuilder().setContent(
-        `${interaction.guild.name} • /lfg • /stats • /history`
-      ))
-      .setAccentColor(0x1E90FF);
-
-    await interaction.followUp({ components: [container], flags: [MessageFlags.IsComponentsV2, MessageFlags.Ephemeral] });
+    historyPages.set(interaction.user.id, 1);
+    await sendHistoryEmbed(interaction, 1, false);
   } catch (err) {
     console.error('⚠️ Erreur historique:', err);
     await interaction.followUp({ content: "❌ Erreur affichage historique.", flags: [MessageFlags.Ephemeral] });
@@ -986,11 +1391,117 @@ async function handleSetLFGChannelCommand(interaction) {
   try {
     setWithTTL(webhookChannels, guild.id, channel.id, WEBHOOK_TTL);
     await saveData();
-    await interaction.followUp({ content: `✅ Salon ${channel} défini pour les annonces LFG.`, flags: [MessageFlags.Ephemeral] });
+    await interaction.followUp({ content: `✅ Salon ${channel} défini pour les annonces LFG cross-serveur.`, flags: [MessageFlags.Ephemeral] });
   } catch (err) {
     console.error('⚠️ Erreur définition salon LFG:', err);
     await interaction.followUp({ content: '❌ Erreur définition salon.', flags: [MessageFlags.Ephemeral] });
   }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function handleConfigCommand(interaction) {
+  const { options, member, guild } = interaction;
+
+  if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+    return interaction.reply({ content: '❌ Vous devez avoir la permission **Gérer le serveur** pour configurer le bot.', flags: [MessageFlags.Ephemeral] });
+  }
+
+  const action = options.getString('action');
+  const game   = options.getString('jeu');
+
+  await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+
+  try {
+    let currentFilter = [...getGuildGameFilter(guild.id)];
+
+    switch (action) {
+      case 'add': {
+        if (!game) return interaction.followUp({ content: '❌ Veuillez spécifier un jeu à ajouter.', flags: [MessageFlags.Ephemeral] });
+        if (currentFilter.includes(game)) return interaction.followUp({ content: `⚠️ **${game}** est déjà dans le filtre.`, flags: [MessageFlags.Ephemeral] });
+        currentFilter.push(game);
+        setWithTTL(guildGameFilters, guild.id, currentFilter, FILTER_TTL);
+        db.prepare('INSERT OR REPLACE INTO guildGameFilters (guildId, games) VALUES (?, ?)').run(guild.id, JSON.stringify(currentFilter));
+        return interaction.followUp({ components: [buildConfigContainer(guild, currentFilter, `✅ **${game}** ajouté au filtre.`)], flags: [MessageFlags.IsComponentsV2, MessageFlags.Ephemeral] });
+      }
+
+      case 'remove': {
+        if (!game) return interaction.followUp({ content: '❌ Veuillez spécifier un jeu à retirer.', flags: [MessageFlags.Ephemeral] });
+        if (!currentFilter.includes(game)) return interaction.followUp({ content: `⚠️ **${game}** n'est pas dans le filtre.`, flags: [MessageFlags.Ephemeral] });
+        currentFilter = currentFilter.filter(g => g !== game);
+        setWithTTL(guildGameFilters, guild.id, currentFilter, FILTER_TTL);
+        db.prepare('INSERT OR REPLACE INTO guildGameFilters (guildId, games) VALUES (?, ?)').run(guild.id, JSON.stringify(currentFilter));
+        return interaction.followUp({ components: [buildConfigContainer(guild, currentFilter, `✅ **${game}** retiré du filtre.`)], flags: [MessageFlags.IsComponentsV2, MessageFlags.Ephemeral] });
+      }
+
+      case 'reset': {
+        setWithTTL(guildGameFilters, guild.id, [], FILTER_TTL);
+        db.prepare('INSERT OR REPLACE INTO guildGameFilters (guildId, games) VALUES (?, ?)').run(guild.id, '[]');
+        return interaction.followUp({ components: [buildConfigContainer(guild, [], '✅ Filtre réinitialisé — tous les jeux sont acceptés.')], flags: [MessageFlags.IsComponentsV2, MessageFlags.Ephemeral] });
+      }
+
+      case 'view':
+      default: {
+        return interaction.followUp({ components: [buildConfigContainer(guild, currentFilter, null)], flags: [MessageFlags.IsComponentsV2, MessageFlags.Ephemeral] });
+      }
+    }
+  } catch (err) {
+    console.error('⚠️ Erreur config:', err);
+    await interaction.followUp({ content: '❌ Erreur lors de la configuration.', flags: [MessageFlags.Ephemeral] });
+  }
+}
+
+/**
+ * Build the config ContainerBuilder — improved layout.
+ */
+function buildConfigContainer(guild, filter, statusMessage) {
+  const thumbnail = new ThumbnailBuilder({
+    media: { url: guild.iconURL({ dynamic: true }) ?? 'https://i.imgur.com/Xo1BHdr.png' },
+  });
+
+  const headerSection = new SectionBuilder()
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`⚙️ **Configuration LFG**`))
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(guild.name))
+    .setThumbnailAccessory(thumbnail);
+
+  const modeLabel = filter.length === 0
+    ? '🌐 **Mode :** Tous les jeux acceptés *(aucun filtre)*'
+    : `🔒 **Mode :** Filtre actif — **${filter.length}** jeu(x) autorisé(s)`;
+
+  const gameList = filter.length === 0
+    ? '_Aucun filtre configuré. Toutes les sessions LFG sont acceptées._'
+    : filter.map(g => `• ${g}`).join('\n');
+
+  const container = new ContainerBuilder().addSectionComponents(headerSection);
+
+  if (statusMessage) {
+    container
+      .addSeparatorComponents(new SeparatorBuilder())
+      .addTextDisplayComponents(new TextDisplayBuilder().setContent(statusMessage));
+  }
+
+  container
+    .addSeparatorComponents(new SeparatorBuilder())
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(modeLabel))
+    .addSeparatorComponents(new SeparatorBuilder())
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`📋 **Jeux autorisés :**\n${gameList}`)
+    )
+    .addSeparatorComponents(new SeparatorBuilder())
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        '💡 **Commandes rapides :**\n' +
+        '`/config action:Ajouter jeu:Valorant` — ajouter un jeu\n' +
+        '`/config action:Retirer jeu:Valorant` — retirer un jeu\n' +
+        '`/config action:Réinitialiser` — tout accepter'
+      )
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`-# ${guild.name}  ·  /config  /lfg  /stats`)
+    )
+    .setAccentColor(0x1E90FF);
+
+  return container;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1002,7 +1513,7 @@ async function handleJoinButton(interaction) {
   const sessionData = lfgSessions.get(sessionId);
 
   if (!sessionData) {
-    return interaction.reply({ content: `❌ Session ${sessionId} introuvable.`, flags: [MessageFlags.Ephemeral] });
+    return interaction.reply({ content: `❌ Session **#${sessionId}** introuvable.`, flags: [MessageFlags.Ephemeral] });
   }
 
   const session     = sessionData.value;
@@ -1013,7 +1524,7 @@ async function handleJoinButton(interaction) {
     return interaction.reply({ content: '❌ Vous avez déjà rejoint cette session.', flags: [MessageFlags.Ephemeral] });
   }
   if (joinedUsers.length >= session.players) {
-    return interaction.reply({ content: '❌ Session pleine.', flags: [MessageFlags.Ephemeral] });
+    return interaction.reply({ content: '❌ Cette session est complète.', flags: [MessageFlags.Ephemeral] });
   }
 
   const voiceChannel = interaction.guild.channels.cache.get(session.voiceChannelId);
@@ -1027,7 +1538,6 @@ async function handleJoinButton(interaction) {
     db.prepare('INSERT OR REPLACE INTO lfgJoinedUsers (sessionId, userId) VALUES (?, ?)').run(sessionId, interaction.user.id);
     await saveData();
 
-    // Refresh info message
     const infoTextChannel = interaction.guild.channels.cache.get(session.infoTextChannelId);
     if (infoTextChannel && session.infoMessageId) {
       try {
@@ -1046,7 +1556,10 @@ async function handleJoinButton(interaction) {
             maxPlayers: session.players,
             gametag: session.gametag,
             description: session.description,
+            twitchUrl: session.twitchUrl,
             participantsMention: joinedUsers.map(id => `<@${id}>`).join(', '),
+            includeJoinButton: joinedUsers.length < session.players,
+            includeNavButtons: true,
           })],
           allowedMentions: { parse: [] },
         });
@@ -1056,7 +1569,7 @@ async function handleJoinButton(interaction) {
     }
 
     await interaction.reply({
-      content: `✅ Session rejointe ! Rejoignez le salon vocal : ${voiceChannel}`,
+      content: `✅ Session **#${sessionId}** rejointe ! Rendez-vous dans : ${voiceChannel}`,
       flags: [MessageFlags.Ephemeral],
     });
     updateRichPresence();
@@ -1082,7 +1595,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  // ── Slash commands ──────────────────────────────────────────────────────────
   if (interaction.isCommand()) {
     switch (interaction.commandName) {
       case 'lfg':             return handleLFGCommand(interaction);
@@ -1093,6 +1605,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       case 'stats':           return handleStatsCommand(interaction);
       case 'history':         return handleHistoryCommand(interaction);
       case 'set_lfg_channel': return handleSetLFGChannelCommand(interaction);
+      case 'config':          return handleConfigCommand(interaction);
       default:
         if (!interaction.replied && !interaction.deferred) {
           await interaction.reply({ content: '❌ Commande inconnue.', flags: [MessageFlags.Ephemeral] });
@@ -1101,15 +1614,44 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  // ── Button interactions ─────────────────────────────────────────────────────
   if (interaction.isButton()) {
+    // ── Pagination de l'historique ─────────────────────────────────────────
+    if (interaction.customId.startsWith('history_prev_') || interaction.customId.startsWith('history_next_')) {
+      const parts     = interaction.customId.split('_');   // ['history','prev'/'next', userId]
+      const direction = parts[1];                          // 'prev' | 'next'
+      const ownerId   = parts[2];
+
+      // Seul l'utilisateur qui a ouvert l'historique peut naviguer
+      if (interaction.user.id !== ownerId) {
+        return interaction.reply({ content: '❌ Cet historique ne vous appartient pas.', flags: [MessageFlags.Ephemeral] });
+      }
+
+      const currentPage = historyPages.get(ownerId) ?? 1;
+      const newPage     = direction === 'prev' ? currentPage - 1 : currentPage + 1;
+      historyPages.set(ownerId, newPage);
+
+      try {
+        await sendHistoryEmbed(interaction, newPage, true);
+      } catch (err) {
+        console.error('⚠️ Erreur pagination historique:', err);
+        if (!interaction.replied && !interaction.deferred)
+          await interaction.reply({ content: '❌ Erreur pagination.', flags: [MessageFlags.Ephemeral] });
+      }
+      return;
+    }
+
+    // ── Bouton page (non-cliquable, ne devrait jamais déclencher) ──────────
+    if (interaction.customId === 'history_page_noop') {
+      return interaction.reply({ content: '​', flags: [MessageFlags.Ephemeral] });
+    }
+
     const [type, sessionId] = interaction.customId.split('_');
 
     const sessionData = lfgSessions.get(sessionId);
     if (!sessionData) {
       if (!interaction.replied && !interaction.deferred) {
         return interaction.reply({
-          content: `❌ Session ${sessionId} introuvable. Elle a peut-être expiré.`,
+          content: `❌ Session **#${sessionId}** introuvable. Elle a peut-être expiré.`,
           flags: [MessageFlags.Ephemeral],
         });
       }
@@ -1125,7 +1667,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const vc = client.guilds.cache.get(session.guildId)?.channels.cache.get(session.voiceChannelId);
         return interaction.reply({
           content: vc
-            ? `🔊 **[${vc.name}](https://discord.com/channels/${session.guildId}/${vc.id})**`
+            ? `🔊 Rejoignez le vocal → **[${vc.name}](https://discord.com/channels/${session.guildId}/${vc.id})**`
             : '❌ Salon vocal introuvable.',
           flags: [MessageFlags.Ephemeral],
         });
@@ -1135,7 +1677,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const tc = client.guilds.cache.get(session.guildId)?.channels.cache.get(session.textChannelId);
         return interaction.reply({
           content: tc
-            ? `💬 **[${tc.name}](https://discord.com/channels/${session.guildId}/${tc.id})**`
+            ? `💬 Salon discussion → **[${tc.name}](https://discord.com/channels/${session.guildId}/${tc.id})**`
             : '❌ Salon discussion introuvable.',
           flags: [MessageFlags.Ephemeral],
         });
@@ -1145,7 +1687,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const ic = client.guilds.cache.get(session.guildId)?.channels.cache.get(session.infoTextChannelId);
         return interaction.reply({
           content: ic
-            ? `📢 **[${ic.name}](https://discord.com/channels/${session.guildId}/${ic.id})**`
+            ? `📢 Salon d'information → **[${ic.name}](https://discord.com/channels/${session.guildId}/${ic.id})**`
             : "❌ Salon d'information introuvable.",
           flags: [MessageFlags.Ephemeral],
         });
@@ -1168,7 +1710,6 @@ client.once(Events.ClientReady, async () => {
   console.log(`✅ Connecté : ${client.user.tag}`);
   await loadData();
 
-  // Remove sessions whose channels no longer exist
   for (const [sessionId, data] of lfgSessions) {
     const session = data.value;
     const guild   = client.guilds.cache.get(session.guildId);
@@ -1192,17 +1733,14 @@ client.once(Events.ClientReady, async () => {
 });
 
 // ─── Periodic cleanup ─────────────────────────────────────────────────────────
-
 setInterval(async () => {
   const now = Date.now();
 
-  // Rate-limiter cleanup
   for (const userId of Object.keys(rateLimiter)) {
     rateLimiter[userId] = rateLimiter[userId].filter(ts => now - ts < 60_000);
     if (!rateLimiter[userId].length) delete rateLimiter[userId];
   }
 
-  // Expired sessions
   for (const [sessionId, data] of lfgSessions) {
     if (data.expiresAt && now > data.expiresAt) {
       const guild = client.guilds.cache.get(data.value.guildId);
@@ -1214,7 +1752,6 @@ setInterval(async () => {
     }
   }
 
-  // Expired joined users cache
   for (const [key, data] of lfgJoinedUsers) {
     if (data.expiresAt && now > data.expiresAt) {
       lfgJoinedUsers.delete(key);
@@ -1222,17 +1759,19 @@ setInterval(async () => {
     }
   }
 
-  // Expired webhook cache
   for (const [key, data] of webhookChannels) {
     if (data.expiresAt && now > data.expiresAt) webhookChannels.delete(key);
   }
+
+  for (const [key, data] of guildGameFilters) {
+    if (data.expiresAt && now > data.expiresAt) guildGameFilters.delete(key);
+  }
 }, 60_000);
 
-// Memory monitor
 setInterval(() => {
   const m = process.memoryUsage();
   console.log(`📊 Mémoire — RSS: ${(m.rss / 1024 / 1024).toFixed(1)}MB | Heap: ${(m.heapUsed / 1024 / 1024).toFixed(1)}/${(m.heapTotal / 1024 / 1024).toFixed(1)}MB`);
-  console.log(`📈 Caches — sessions: ${lfgSessions.size} | users: ${lfgJoinedUsers.size} | webhooks: ${webhookChannels.size}`);
+  console.log(`📈 Caches — sessions: ${lfgSessions.size} | users: ${lfgJoinedUsers.size} | webhooks: ${webhookChannels.size} | filtres: ${guildGameFilters.size}`);
 }, 300_000);
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────
