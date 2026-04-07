@@ -40,6 +40,14 @@ CLIENT_ID=VOTRE_CLIENT_ID
 
 4. Exécutez le bot avec la commande `node index.js`.
 
+## Ajouter le bot
+
+- Les permissions nécessaires pour ajouter le bot à vos serveurs
+
+```plaintext
+https://discord.com/oauth2/authorize?client_id=ID_BOT&permissions=2251802515958806&scope=bot+applications.commands
+```
+
 ## Commandes
 
 Le bot utilise des commandes slash pour interagir avec les utilisateurs. Voici les commandes disponibles :
