@@ -406,18 +406,31 @@ function buildCrossServerContainer({
 }
 
 // ─── Presence ─────────────────────────────────────────────────────────────────
-async function updateRichPresence() {
+let _presenceIndex = 0;
+
+function updateRichPresence() {
   try {
+    if (!client.user) return;
     const totalSessions = lfgSessions.size;
     const totalPlayers  = Array.from(lfgJoinedUsers.values()).reduce((acc, d) => acc + (d.value?.length ?? 0), 0);
-    client.user?.setPresence({
-      activities: [{ name: `Sessions: ${totalSessions} | Joueurs: ${totalPlayers}`, type: ActivityType.Playing }],
-      status: 'online',
-    });
+
+    const activities = [
+      { name: `🔍 Recherche de groupe`, type: ActivityType.Custom, state: `🔍 Recherche de groupe` },
+      { name: `${totalSessions} session${totalSessions !== 1 ? 's' : ''} active${totalSessions !== 1 ? 's' : ''}`, type: ActivityType.Custom },
+      { name: `${totalPlayers} joueur${totalPlayers !== 1 ? 's' : ''} en session`, type: ActivityType.Custom },
+    ];
+
+    const activity = activities[_presenceIndex % activities.length];
+    _presenceIndex++;
+
+    client.user.setPresence({ activities: [activity], status: 'online' });
   } catch (err) {
     console.error('⚠️ Erreur Rich Presence:', err.message);
   }
 }
+
+// Rotation de la présence toutes les 30 secondes
+setInterval(updateRichPresence, 30_000);
 
 // ─── Rate limiter ─────────────────────────────────────────────────────────────
 function checkRateLimit(userId) {
@@ -706,6 +719,8 @@ async function handleAutocomplete(interaction) {
   const { commandName, options, guild } = interaction;
   const focused = options.getFocused(true);
 
+  if (!guild) return interaction.respond([]).catch(() => {});
+
   if (focused.name === 'session_id') {
     const input   = focused.value.toLowerCase();
     const choices = [];
@@ -829,8 +844,8 @@ async function createLFGSession({ interaction, guild, channel, user, game, platf
         organizerMention: `<@${user.id}>`, game, platform, activity,
         joinedCount: 1, maxPlayers: players, gametag, description, twitchUrl,
       });
-      const wh = await tc.createWebhook({ name: 'LFG Annonce', avatar: client.user.avatarURL() });
-      await wh.send({ components: [cc], flags: MessageFlags.IsComponentsV2, username: client.user.username, avatarURL: client.user.avatarURL(), allowedMentions: { parse: ['users'] } });
+      const wh = await tc.createWebhook({ name: 'LFG Annonce', avatar: client.user.avatarURL() ?? undefined });
+      await wh.send({ components: [cc], flags: MessageFlags.IsComponentsV2, username: client.user.username, avatarURL: client.user.avatarURL() ?? undefined, allowedMentions: { parse: ['users'] } });
       await wh.delete();
     } catch (err) { console.error(`⚠️ Erreur annonce vers ${gId}:`, err.message); }
   }
@@ -1045,6 +1060,7 @@ async function handleKickMemberCommand(interaction) {
   const targetMember = options.getMember('member');
   const sessionData  = lfgSessions.get(sessionId);
   if (!sessionData) return interaction.reply({ content: `❌ Session **#${sessionId}** introuvable.`, flags: [MessageFlags.Ephemeral] });
+  if (!targetMember) return interaction.reply({ content: '❌ Membre introuvable sur ce serveur.', flags: [MessageFlags.Ephemeral] });
   const session = sessionData.value;
   if (user.id !== session.userId) return interaction.reply({ content: '❌ Seuls les organisateurs peuvent retirer des membres.', flags: [MessageFlags.Ephemeral] });
 
@@ -1074,6 +1090,7 @@ async function handleBanMemberCommand(interaction) {
   const targetMember = options.getMember('member');
   const sessionData  = lfgSessions.get(sessionId);
   if (!sessionData) return interaction.reply({ content: `❌ Session **#${sessionId}** introuvable.`, flags: [MessageFlags.Ephemeral] });
+  if (!targetMember) return interaction.reply({ content: '❌ Membre introuvable sur ce serveur.', flags: [MessageFlags.Ephemeral] });
   const session = sessionData.value;
   if (user.id !== session.userId) return interaction.reply({ content: '❌ Seuls les organisateurs peuvent bannir des membres.', flags: [MessageFlags.Ephemeral] });
 
@@ -1596,8 +1613,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  const guildId = newState.guild.id;
   const entry = Array.from(lfgSessions.entries()).find(([, d]) =>
-    d.value.voiceChannelId === oldState.channelId || d.value.voiceChannelId === newState.channelId
+    d.value.guildId === guildId &&
+    (d.value.voiceChannelId === oldState.channelId || d.value.voiceChannelId === newState.channelId)
   );
   if (entry) resetTimeout(entry[0], newState.guild);
 });
@@ -1653,11 +1672,14 @@ setInterval(async () => {
 }, 60_000);
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────
+let _shuttingDown = false;
 async function shutdown(code = 0) {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
   console.log('🛑 Arrêt en cours, sauvegarde des données…');
-  await saveData();
-  db.close();
-  client.destroy();
+  try { await saveData(); } catch {}
+  try { db.close(); } catch {}
+  try { client.destroy(); } catch {}
   process.exit(code);
 }
 
