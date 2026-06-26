@@ -2,6 +2,8 @@
 
 import dotenv from 'dotenv';
 import {
+  REST, 
+  Routes,
   Client,
   GatewayIntentBits,
   ChannelType,
@@ -597,6 +599,8 @@ async function loadData() {
 
 // ─── Slash command registration ───────────────────────────────────────────────
 async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
   const platformChoices = [
     { name: 'PC', value: 'PC' }, { name: 'PlayStation 5', value: 'PlayStation 5' },
     { name: 'PlayStation 4', value: 'PlayStation 4' }, { name: 'Xbox Series X|S', value: 'Xbox Series X|S' },
@@ -613,7 +617,6 @@ async function registerCommands() {
     { name: 'PvE', value: 'PvE' }, { name: 'PvP', value: 'PvP' }, { name: 'Raids', value: 'Raids' }, { name: 'Dungeons', value: 'Dungeons' },
   ];
 
-  // Reusable session_id option with autocomplete
   const sessionIdOpt = { name: 'session_id', description: 'ID de la session', type: 3, required: true, autocomplete: true };
 
   const commands = [
@@ -704,7 +707,10 @@ async function registerCommands() {
   ];
 
   try {
-    await client.application.commands.set(commands);
+    await rest.put(
+      Routes.applicationCommands(process.env.CLIENT_ID),
+      { body: commands },
+    );
     console.log('✅ Commandes enregistrées.');
   } catch (err) {
     console.error('⚠️ Erreur enregistrement commandes:', err.message);
